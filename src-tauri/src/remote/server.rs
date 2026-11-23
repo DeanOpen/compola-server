@@ -212,7 +212,11 @@ async fn serve(remote: Arc<Remote>, stream: TcpStream, peer: SocketAddr) {
 
         let result = if method == "GET" && (path == "/" || path == "/info") {
             match conn.skip_body(length).await {
-                Ok(()) => conn.respond_json(200, &json!({ "app": "compola-server", "version": version() }), close).await,
+                Ok(()) => {
+                    // `instance` lets a Compola app notice it is about to join itself.
+                    let body = json!({ "app": "compola-server", "version": version(), "instance": remote.config.lock().instance.clone() });
+                    conn.respond_json(200, &body, close).await
+                }
                 Err(e) => Err(e),
             }
         } else if path == "/admin" || path.starts_with("/admin/") {

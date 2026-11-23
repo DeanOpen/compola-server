@@ -575,6 +575,31 @@ async fn admin_route(ctx: &Ctx<'_>, admin: &User, method: &str, seg: &[&str]) ->
             Ok(Reply::ok(json!(store.audit_entries(limit, before, user_id.as_deref(), action.as_deref())?)))
         }
 
+        // the host's Zalo account: status, sign-in by QR, sign-out (a host can be run headless / from afar)
+        ("GET", ["zalo"]) => {
+            let engine = remote.engine().ok_or_else(|| StoreError::new(503, "Engine chưa chạy."))?;
+            Ok(Reply::ok(json!({ "phase": engine.phase(), "account": remote.account_json() })))
+        }
+        ("POST", ["zalo", "qr"]) => {
+            let engine = remote.engine().ok_or_else(|| StoreError::new(503, "Engine chưa chạy."))?;
+            engine.refresh_qr();
+            ctx.audit(admin, "zalo.qr", "", json!({}));
+            Ok(Reply::ok(json!({ "ok": true })))
+        }
+        ("POST", ["zalo", "logout"]) => {
+            let engine = remote.engine().ok_or_else(|| StoreError::new(503, "Engine chưa chạy."))?;
+            let account = remote.account_json();
+            engine.log_out();
+            ctx.audit(admin, "zalo.logout", account.get("name").and_then(Value::as_str).unwrap_or_default(), json!({}));
+            Ok(Reply::ok(json!({ "ok": true })))
+        }
+        ("POST", ["zalo", "retry"]) => {
+            let engine = remote.engine().ok_or_else(|| StoreError::new(503, "Engine chưa chạy."))?;
+            engine.retry_runtime_setup();
+            ctx.audit(admin, "zalo.retry", "", json!({}));
+            Ok(Reply::ok(json!({ "ok": true })))
+        }
+
         // the account
         ("GET", ["conversations"]) => Ok(Reply::ok(remote.mirror.read().conversations_json())),
         ("GET", ["server"]) => Ok(Reply::ok(remote.server_info_json())),

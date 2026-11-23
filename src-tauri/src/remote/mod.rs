@@ -151,6 +151,20 @@ pub fn computer_name() -> String {
     .clone()
 }
 
+/// Whether a server URL names this Mac (loopback, `localhost`, or one of its own addresses).
+fn points_at_this_mac(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else { return false };
+    match u.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost") || d == computer_name().to_ascii_lowercase().replace(' ', "-") + ".local"
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified() || local_addresses().iter().any(|a| a.get("ip").and_then(Value::as_str) == Some(&ip.to_string())),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        None => false,
+    }
+}
+
 /// The IPv4 addresses joined apps can reach this Mac on: `{ip, kind: lan|tailscale|public}`.
 fn local_addresses() -> Vec<Value> {
     let mut out: Vec<(std::net::Ipv4Addr, &'static str)> = Vec::new();
@@ -213,7 +227,14 @@ pub struct Remote {
 
 impl Remote {
     pub fn new(app: AppHandle) -> Arc<Self> {
-        let config = load();
+        let mut config = load();
+        // A host that joined its own server (loopback / its own address while its server is on) would never start
+        // the server it waits for: back to host mode.
+        if config.server.enabled && config.join.as_ref().is_some_and(|j| points_at_this_mac(&j.url)) {
+            log::warn!("compola server: this app had joined its own server; leaving it");
+            config.join = None;
+            let _ = save(&config);
+        }
         let client = config.join.clone().and_then(|join| match Client::new(app.clone(), join, config.instance.clone()) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -459,6 +480,23 @@ impl Remote {
         })
     }
 
+    /// A join must not switch off this app's own shared account: refused while its server is on, and never to itself.
+    fn check_join(&self, server: &Value) -> Result<(), String> {
+        let (instance, enabled) = {
+            let c = self.config.lock();
+            (c.instance.clone(), c.server.enabled)
+        };
+        if server.get("instance").and_then(Value::as_str) == Some(instance.as_str()) {
+            return Err("Đây là Compola Server của chính máy này. Máy này đã dùng tài khoản Zalo của nó, không cần tham gia.".into());
+        }
+        if enabled {
+            return Err(
+                "Máy này đang bật Compola Server. Tham gia máy chủ khác sẽ tắt tài khoản Zalo đang chia sẻ: hãy tắt Compola Server trong Cài đặt trước.".into(),
+            );
+        }
+        Ok(())
+    }
+
     fn save_join(&self, join: JoinConfig) -> Result<(), String> {
         let last = LastJoin { url: join.url.clone(), device_name: join.device_name.clone(), username: join.username.clone() };
         self.update_config(|c| {
@@ -602,9 +640,10 @@ pub fn remote_kick(remote: RemoteState<'_>, session_id: String) -> Result<bool, 
 
 /// Checks the address and lists how to sign in: `{url, serverName, local, ldap, oidc}`.
 #[tauri::command]
-pub async fn remote_providers(url: String) -> Result<Value, String> {
+pub async fn remote_providers(remote: RemoteState<'_>, url: String) -> Result<Value, String> {
     let base = client::normalize_url(&url)?;
     let mut providers = client::providers(&base).await?;
+    remote.check_join(&providers)?;
     providers["url"] = json!(base.to_string());
     Ok(providers)
 }
@@ -629,10 +668,12 @@ pub async fn remote_join_password(
         return Err("Máy này đang tham gia một Compola Server khác.".into());
     }
     let base = client::normalize_url(&url)?;
+    let server = client::providers(&base).await?;
+    remote.check_join(&server)?;
     let device_name = device_name_or_default(&device_name);
     let instance = remote.config.lock().instance.clone();
     let signed_in = client::login_password(&base, &username, &password, provider.as_deref().unwrap_or("local"), &device_name, &instance).await?;
-    let server_name = client::providers(&base).await.ok().and_then(|p| p.get("serverName").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+    let server_name = server.get("serverName").and_then(Value::as_str).unwrap_or_default().to_owned();
     remote.save_join(JoinConfig {
         url: base.to_string(),
         token: signed_in.token,
@@ -658,6 +699,8 @@ pub async fn remote_join_browser(
         return Err("Máy này đang tham gia một Compola Server khác.".into());
     }
     let base = client::normalize_url(&url)?;
+    let server = client::providers(&base).await?;
+    remote.check_join(&server)?;
     let device_name = device_name_or_default(&device_name);
     let instance = remote.config.lock().instance.clone();
     let mut start = client::device_start(&base, &device_name, &instance).await?;
@@ -678,7 +721,7 @@ pub async fn remote_join_browser(
     };
     remote.join_cancel.lock().take();
     let signed_in = outcome?;
-    let server_name = client::providers(&base).await.ok().and_then(|p| p.get("serverName").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+    let server_name = server.get("serverName").and_then(Value::as_str).unwrap_or_default().to_owned();
     remote.save_join(JoinConfig {
         url: base.to_string(),
         token: signed_in.token,

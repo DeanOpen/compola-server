@@ -90,6 +90,8 @@ pub async fn providers(base: &url::Url) -> Result<Value, String> {
     if status != 200 {
         return Err(api_error(&body, status));
     }
+    let mut body = body;
+    body["instance"] = info.get("instance").cloned().unwrap_or(Value::Null);
     Ok(body)
 }
 
