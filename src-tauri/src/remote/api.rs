@@ -18,6 +18,8 @@ static ADMIN: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/admin-dist");
 static WEB: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web-dist");
 
 pub const COOKIE: &str = "compola_session";
+/// A browser's stable device id (not a credential).
+const BROWSER_COOKIE: &str = "compola_browser";
 /// Largest JSON body.
 pub const MAX_BODY: u64 = 1 << 20;
 
@@ -50,6 +52,11 @@ impl Reply {
 
     fn with_header(mut self, k: &str, v: String) -> Self {
         self.headers.push((k.into(), v));
+        self
+    }
+
+    fn with_cookies(mut self, cookies: Vec<String>) -> Self {
+        self.headers.extend(cookies.into_iter().map(|c| ("Set-Cookie".to_owned(), c)));
         self
     }
 }
@@ -107,6 +114,29 @@ impl Ctx<'_> {
     /// A web session's label: "Chrome · macOS" from the User-Agent (the console's sessions have no device id).
     fn browser(&self) -> String {
         browser_label(self.head.header("user-agent").unwrap_or_default())
+    }
+
+    /// This browser's device id: a random id kept in its own long-lived cookie, so two browsers of the same kind
+    /// (both "Chrome · macOS") stay distinct in the device lists. Returns (id, Set-Cookie when new).
+    fn browser_id(&self) -> (String, Option<String>) {
+        if let Some(id) = cookie_value(self.head, BROWSER_COOKIE).filter(|v| v.len() == 16 && v.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return (format!("web-{id}"), None);
+        }
+        let id = super::store::new_token()[..16].to_owned();
+        let cookie = format!(
+            "{BROWSER_COOKIE}={id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=63072000{}",
+            if self.secure() { "; Secure" } else { "" }
+        );
+        (format!("web-{id}"), Some(cookie))
+    }
+
+    /// A web session for `user` → (token, Set-Cookie headers).
+    fn web_session(&self, user: &User) -> R<(String, Vec<String>)> {
+        let (device_id, device_cookie) = self.browser_id();
+        let (_, token) = self.auth.store.create_session(&user.id, "web", &device_id, &self.browser(), &self.ip, auth::WEB_TTL_MS)?;
+        let mut cookies = vec![self.session_cookie(&token)];
+        cookies.extend(device_cookie);
+        Ok((token, cookies))
     }
 
     fn current(&self) -> R<(Session, User)> {
@@ -205,10 +235,10 @@ async fn route(ctx: &Ctx<'_>, method: &str, seg: &[&str]) -> R<Reply> {
         ("GET", ["auth", "otp"]) => {
             let user_id = ctx.head.param("t").and_then(|t| ctx.auth.otp_take(&t)).ok_or_else(|| StoreError::new(401, "Liên kết đã hết hạn. Mở lại từ Compola."))?;
             let user = ctx.auth.store.user(&user_id)?;
-            let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", &ctx.browser(), &ctx.ip, auth::WEB_TTL_MS)?;
+            let (_, cookies) = ctx.web_session(&user)?;
             ctx.audit(&user, "login", "link", json!({ "method": "one-time link" }));
             let next = safe_next(ctx.head.param("next"));
-            Ok(Reply::redirect(&next).with_header("Set-Cookie", ctx.session_cookie(&token)))
+            Ok(Reply::redirect(&next).with_cookies(cookies))
         }
         // A one-time sign-in link for the admin console, minted by a signed-in app (device token) for its user.
         ("POST", ["auth", "link"]) => {
@@ -345,8 +375,8 @@ async fn login(ctx: &Ctx<'_>) -> R<Reply> {
             Ok(Reply::ok(json!({ "token": token, "user": user.brief() })))
         }
         None => {
-            let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", &ctx.browser(), &ctx.ip, auth::WEB_TTL_MS)?;
-            Ok(Reply::ok(json!({ "user": user })).with_header("Set-Cookie", ctx.session_cookie(&token)))
+            let (_, cookies) = ctx.web_session(&user)?;
+            Ok(Reply::ok(json!({ "user": user })).with_cookies(cookies))
         }
     }
 }
@@ -359,12 +389,12 @@ async fn oidc_callback(ctx: &Ctx<'_>) -> R<Reply> {
     let code = ctx.head.param("code").unwrap_or_default();
     let state = ctx.head.param("state").unwrap_or_default();
     let (user, next, device) = ctx.auth.oidc_callback(&code, &state, &ctx.ip).await?;
-    let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", &ctx.browser(), &ctx.ip, auth::WEB_TTL_MS)?;
+    let (_, cookies) = ctx.web_session(&user)?;
     let target = match device {
         Some(code) => format!("/admin/#/device?code={}", encode(&code)),
         None => next,
     };
-    Ok(Reply::redirect(&target).with_header("Set-Cookie", ctx.session_cookie(&token)))
+    Ok(Reply::redirect(&target).with_cookies(cookies))
 }
 
 // ---- admin routes ----
