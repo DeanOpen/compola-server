@@ -223,6 +223,8 @@ pub struct Remote {
     join_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// The listener runs: the mirror follows the renderer's state.
     serving: std::sync::atomic::AtomicBool,
+    /// The host app's own sign-in to its server (the owner), for the native admin screens (`remote_api`).
+    owner_token: Mutex<Option<String>>,
 }
 
 impl Remote {
@@ -264,6 +266,7 @@ impl Remote {
             mirror: RwLock::new(policy::Mirror::default()),
             join_cancel: Mutex::new(None),
             serving: std::sync::atomic::AtomicBool::new(false),
+            owner_token: Mutex::new(None),
         })
     }
 
@@ -497,6 +500,17 @@ impl Remote {
         Ok(())
     }
 
+    /// The admin the host app acts as: the one created in the app, else the oldest active admin.
+    fn owner(&self, auth: &auth::Auth) -> Result<store::User, String> {
+        let owner = self.config.lock().owner_user_id.clone();
+        auth.store
+            .user(&owner)
+            .ok()
+            .filter(|u| u.is_admin && !u.disabled)
+            .or_else(|| auth.store.first_admin().ok().flatten())
+            .ok_or_else(|| "Tạo tài khoản quản trị trước.".to_owned())
+    }
+
     fn save_join(&self, join: JoinConfig) -> Result<(), String> {
         let last = LastJoin { url: join.url.clone(), device_name: join.device_name.clone(), username: join.username.clone() };
         self.update_config(|c| {
@@ -605,22 +619,66 @@ pub fn remote_admin_setup(remote: RemoteState<'_>, username: String, password: S
 
 /// Opens the admin console in the browser, signed in as the owner (a one-time link).
 #[tauri::command]
-pub async fn remote_admin_open(remote: RemoteState<'_>) -> Result<String, String> {
+pub async fn remote_admin_open(remote: RemoteState<'_>, next: Option<String>) -> Result<String, String> {
+    let next = next.filter(|n| n.starts_with("/admin/")).unwrap_or_else(|| "/admin/".into());
+    // Joined: the console of the server, signed in as this device's user.
+    if let Some(client) = &remote.client {
+        let url = client.admin_link(&next).await?;
+        tauri_plugin_opener::open_url(&url, None::<&str>).map_err(|e| e.to_string())?;
+        return Ok(url);
+    }
     let auth = remote.auth().ok_or("Không mở được cơ sở dữ liệu tài khoản.")?;
     let Some(port) = remote.server.lock().await.as_ref().map(|h| h.port) else {
         return Err("Bật Compola Server trước.".into());
     };
-    let owner = remote.config.lock().owner_user_id.clone();
-    let user = auth
-        .store
-        .user(&owner)
-        .ok()
-        .filter(|u| u.is_admin && !u.disabled)
-        .or_else(|| auth.store.first_admin().ok().flatten())
-        .ok_or("Tạo tài khoản quản trị trước.")?;
-    let url = format!("http://127.0.0.1:{port}/api/auth/otp?t={}", auth.otp_create(&user.id));
+    let user = remote.owner(&auth)?;
+    let next: String = url::form_urlencoded::byte_serialize(next.as_bytes()).collect();
+    let url = format!("http://127.0.0.1:{port}/api/auth/otp?t={}&next={next}", auth.otp_create(&user.id));
     tauri_plugin_opener::open_url(&url, None::<&str>).map_err(|e| e.to_string())?;
     Ok(url)
+}
+
+/// The server's REST API (`path` below `/api/`, e.g. `admin/users`) for the app's native admin screens: as this
+/// device's user when joined, as the owner on the host. The server checks the rights of every call.
+#[tauri::command]
+pub async fn remote_api(remote: RemoteState<'_>, method: String, path: String, body: Option<Value>) -> Result<Value, String> {
+    let method = method.to_ascii_uppercase();
+    if !matches!(method.as_str(), "GET" | "POST" | "PATCH" | "PUT" | "DELETE") {
+        return Err("bad method".into());
+    }
+    let path = path.trim_start_matches('/').to_owned();
+    if path.contains("..") || path.contains("://") || !(path.starts_with("admin/") || path.starts_with("me") || path.starts_with("device/")) {
+        return Err("bad path".into());
+    }
+    if let Some(client) = &remote.client {
+        return client.api(&method, &path, body).await;
+    }
+    let auth = remote.auth().ok_or("Không mở được cơ sở dữ liệu tài khoản.")?;
+    let Some(port) = remote.server.lock().await.as_ref().map(|h| h.port) else {
+        return Err("Bật Compola Server trước.".into());
+    };
+    let base = url::Url::parse(&format!("http://127.0.0.1:{port}/")).map_err(|e| e.to_string())?;
+    let http = reqwest::Client::new();
+    for attempt in 0..2 {
+        let token = match remote.owner_token.lock().clone() {
+            Some(t) => t,
+            None => {
+                let user = remote.owner(&auth)?;
+                let (_, t) = auth.store.create_session(&user.id, "web", "", "Ứng dụng Compola (máy chủ)", "127.0.0.1", auth::WEB_TTL_MS).map_err(|e| e.message)?;
+                *remote.owner_token.lock() = Some(t.clone());
+                t
+            }
+        };
+        match client::api_call(&http, &base, &token, &method, &path, body.clone()).await {
+            // The owner session expired or was revoked: a new one, once.
+            Err(e) if attempt == 0 && auth.store.session_by_token(&token, "127.0.0.1", None).ok().flatten().is_none() => {
+                log::debug!("compola server: owner session renewed ({e})");
+                *remote.owner_token.lock() = None;
+            }
+            other => return other,
+        }
+    }
+    Err("Không gọi được máy chủ.".into())
 }
 
 /// Revokes a joined session (the person signs in again to come back).

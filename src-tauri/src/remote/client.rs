@@ -95,6 +95,23 @@ pub async fn providers(base: &url::Url) -> Result<Value, String> {
     Ok(body)
 }
 
+/// `method path` under `<base>api/` with a bearer token: the JSON answer, or the server's `{error}`.
+pub async fn api_call(http: &reqwest::Client, base: &url::Url, token: &str, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "bad method".to_owned())?;
+    let mut req = http
+        .request(method, endpoint(base, &format!("api/{path}")))
+        .bearer_auth(token)
+        .header("X-Compola", "1")
+        .timeout(Duration::from_secs(60));
+    if let Some(body) = body {
+        req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(body.to_string());
+    }
+    let r = req.send().await.map_err(|e| describe(&e, base))?;
+    let status = r.status().as_u16();
+    let value = r.bytes().await.ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null);
+    if (200..300).contains(&status) { Ok(value) } else { Err(api_error(&value, status)) }
+}
+
 fn api_error(body: &Value, status: u16) -> String {
     body.get("error").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("Máy chủ trả lời HTTP {status}."))
 }
@@ -267,6 +284,19 @@ impl Client {
 
     pub fn status_json(&self) -> Value {
         serde_json::to_value(self.status.lock().clone()).unwrap_or(Value::Null)
+    }
+
+    /// One call of the server's REST API as this device's user (`path` below `/api/`); the server checks the rights.
+    pub async fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+        api_call(&self.http, &self.base, &self.join.token, method, path, body).await
+    }
+
+    /// The admin console in the browser, signed in as this device's user (a one-time link), at `next` (`/admin/…`).
+    pub async fn admin_link(&self, next: &str) -> Result<String, String> {
+        let r = self.api("POST", "auth/link", None).await?;
+        let token = r.get("token").and_then(Value::as_str).ok_or("Máy chủ không trả về liên kết.")?;
+        let next: String = url::form_urlencoded::byte_serialize(next.as_bytes()).collect();
+        Ok(endpoint(&self.base, &format!("api/auth/otp?t={token}&next={next}")))
     }
 
     /// Signs this device out on the server (best effort; used when leaving).

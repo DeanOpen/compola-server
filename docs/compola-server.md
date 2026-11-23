@@ -63,7 +63,7 @@ Auth: admin console = cookie `compola_session` **and** header `X-Compola: 1` on 
 something (cross-site forms cannot set it). Joined apps = `Authorization: Bearer <device token>`.
 
 ### Public
-- `GET /info` → `{app: "compola-server", version}`
+- `GET /info` → `{app: "compola-server", version, instance}` (`instance`: a joining app refuses its own server)
 - `GET /api/auth/providers` → `{serverName, local: true, ldap: [{id, name}], oidc: [{id, name}]}`
 
 ### Sign-in
@@ -73,6 +73,8 @@ something (cross-site forms cannot set it). Joined apps = `Authorization: Bearer
 - `GET /api/auth/oidc/callback?code&state` → session cookie, 302 to `next` (or the device approval page).
 - `GET /api/auth/otp?t=<one-time token>` → session cookie for the host's owner (created by the host app's
   "Mở trang quản trị" button), 302 to `/admin/`.
+- `POST /api/auth/link` (signed in, any user) → `{token}`: a one-time link `GET /api/auth/otp?t=<token>&next=/admin/…`
+  that opens the console signed in as that user (the apps' "Mở trang quản trị").
 - `POST /api/auth/logout` → clears the cookie / revokes the bearer token.
 - `GET /api/me` → `{user, access: {role: "admin" | "agent" | "viewer" | null, scope}}`
 
@@ -100,6 +102,10 @@ something (cross-site forms cannot set it). Joined apps = `Authorization: Bearer
 - Audit: `GET /api/admin/audit?limit=100&before=<id>&userId=&action=`
 - Account data for the grant editor: `GET /api/admin/conversations` → `{conversations: [{id, name, isGroup, avatar,
   labels: [labelId]}], labels: [{id, name, color}]}` (from what the host's renderer posted)
+- The host's Zalo account: `GET /api/admin/zalo` → `{phase, account: {name, avatar, phase}}` (`phase` is the engine
+  phase, `login.qr` a data URL, steps generating / waitingScan / waitingConfirm {name, avatar} / expired / failed);
+  `POST /api/admin/zalo/qr` (new QR), `POST /api/admin/zalo/logout` (sign the host out of Zalo), `POST
+  /api/admin/zalo/retry` (runtime setup). All audited (`zalo.*`). Poll `GET` every ~2 s while the screen is open.
 - Server: `GET /api/admin/server` → `{name, version, publicUrl, account: {name, avatar, phase}, listen: {port,
   allowNetwork}, addresses}` · `PATCH /api/admin/server` `{name?, publicUrl?}`
 
@@ -141,6 +147,15 @@ regains focus.
 - `remote_admin_setup({username, password, displayName})` → creates the first admin (only when there is none)
 - `remote_admin_open()` → opens the admin console in the browser, signed in as the owner (one-time link); returns it
 - `remote_kick(sessionId)` → revokes a session
+- `remote_api({method, path, body?})` → the REST API above (`path` below `/api/`: `admin/…`, `me…`, `device/…`) for the
+  app's native admin screens: as the device's user when joined (bearer token), as the owner on the host. The server
+  enforces admin on `admin/*`. Errors are the server's Vietnamese `{error}` text.
+- `remote_admin_open({next?})` → opens `<server>/admin/` (or `next`, e.g. `/admin/#/audit`) signed in: the owner on the
+  host, the device's user when joined.
+
+Joining is refused when the server's `instance` is this install, and while this app's own server is enabled (it
+would stop sharing its account). A saved join to this Mac (loopback / own address) is dropped at startup when the
+server is enabled. Leaving (`remote_leave`) restarts the app in host mode: engine, automation and server start again.
 
 ## Joined app — Tauri commands
 

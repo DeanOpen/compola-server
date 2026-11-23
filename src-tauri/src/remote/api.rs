@@ -203,8 +203,14 @@ async fn route(ctx: &Ctx<'_>, method: &str, seg: &[&str]) -> R<Reply> {
             let user_id = ctx.head.param("t").and_then(|t| ctx.auth.otp_take(&t)).ok_or_else(|| StoreError::new(401, "Liên kết đã hết hạn. Mở lại từ Compola."))?;
             let user = ctx.auth.store.user(&user_id)?;
             let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", &ctx.browser(), &ctx.ip, auth::WEB_TTL_MS)?;
-            ctx.audit(&user, "login", "owner", json!({ "method": "owner-link" }));
-            Ok(Reply::redirect("/admin/").with_header("Set-Cookie", ctx.session_cookie(&token)))
+            ctx.audit(&user, "login", "link", json!({ "method": "one-time link" }));
+            let next = safe_next(ctx.head.param("next"));
+            Ok(Reply::redirect(&next).with_header("Set-Cookie", ctx.session_cookie(&token)))
+        }
+        // A one-time sign-in link for the admin console, minted by a signed-in app (device token) for its user.
+        ("POST", ["auth", "link"]) => {
+            let (_, user) = ctx.current()?;
+            Ok(Reply::ok(json!({ "token": ctx.auth.otp_create(&user.id) })))
         }
         ("POST", ["auth", "logout"]) => {
             if let Some(token) = request_token(ctx.head) {
