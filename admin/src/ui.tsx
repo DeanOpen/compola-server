@@ -1,6 +1,7 @@
 // Small component kit of the admin console (styles in styles.css).
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, Check, Copy, Globe, Loader2, Lock, MonitorSmartphone, MoreHorizontal, RefreshCw, Search, Users, X } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { AlertTriangle, Check, ChevronDown, Copy, Globe, Loader2, Lock, MonitorSmartphone, MoreHorizontal, RefreshCw, Search, Users, X } from 'lucide-react';
 import { ApiError } from './api';
 import { initials, shortId, sourceInfo, type ActionTone } from './format';
 import { toast, useStore } from './store';
@@ -356,7 +357,21 @@ export function PageHeader({ title, subtitle, actions }: { title: ReactNode; sub
   );
 }
 
-export function Card({ title, actions, children, className, pad = true }: { title?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string; pad?: boolean }) {
+export function Card({
+  title,
+  actions,
+  children,
+  className,
+  pad = true,
+  foot,
+}: {
+  title?: ReactNode;
+  actions?: ReactNode;
+  children: ReactNode;
+  className?: string;
+  pad?: boolean;
+  foot?: ReactNode;
+}) {
   return (
     <section className={cx('card', className)}>
       {(title || actions) && (
@@ -366,6 +381,7 @@ export function Card({ title, actions, children, className, pad = true }: { titl
         </div>
       )}
       <div className={cx(pad && 'card-body')}>{children}</div>
+      {foot && <div className="card-foot">{foot}</div>}
     </section>
   );
 }
@@ -542,16 +558,33 @@ export function SinglePicker({ items, value, onChange, placeholder, height = 320
   );
 }
 
-export function Stat({ label, value, sub, icon }: { label: string; value: ReactNode; sub?: ReactNode; icon?: ReactNode }) {
+export function Stat({
+  label,
+  value,
+  sub,
+  icon,
+  tone,
+  href,
+}: {
+  label: string;
+  value: ReactNode;
+  sub?: ReactNode;
+  icon?: ReactNode;
+  /** "danger": the number is a problem (failed sign-ins). */
+  tone?: 'danger';
+  /** The whole tile links to the page with the details. */
+  href?: string;
+}) {
+  const Tag = href ? 'a' : 'div';
   return (
-    <div className="stat">
+    <Tag className={cx('stat', tone && `is-${tone}`, href && 'is-link')} href={href}>
       <div className="stat-top">
         <span className="secondary">{label}</span>
         {icon && <span className="stat-icon">{icon}</span>}
       </div>
       <div className="stat-value nums">{value}</div>
       {sub && <div className="stat-sub secondary">{sub}</div>}
-    </div>
+    </Tag>
   );
 }
 
@@ -644,40 +677,99 @@ export interface MenuItem {
   onSelect: () => void;
 }
 
-/** Row "⋯" menu. The popover is position: fixed, so table scroll containers do not clip it. */
-export function RowMenu({ items, label = 'Thao tác' }: { items: (MenuItem | false | null | undefined)[]; label?: string }) {
-  const [open, setOpen] = useState(false);
+/**
+ * A popover anchored to a button. position: fixed, so table scroll containers do not clip it. Closes on outside click,
+ * Escape, page scroll and resize.
+ */
+export function Popover({
+  anchor,
+  open,
+  onClose,
+  align = 'end',
+  children,
+  className,
+  role = 'menu',
+}: {
+  anchor: React.RefObject<HTMLElement | null>;
+  open: boolean;
+  onClose: () => void;
+  align?: 'start' | 'end';
+  children: ReactNode;
+  className?: string;
+  role?: string;
+}) {
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
-  const btn = useRef<HTMLButtonElement>(null);
   const pop = useRef<HTMLDivElement>(null);
-  const list = items.filter(Boolean) as MenuItem[];
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useLayoutEffect(() => {
-    if (!open || !btn.current) return;
-    const r = btn.current.getBoundingClientRect();
+    if (!open || !anchor.current) {
+      setPos(null);
+      return;
+    }
+    const r = anchor.current.getBoundingClientRect();
     const w = pop.current?.offsetWidth ?? 200;
     const h = pop.current?.offsetHeight ?? 0;
     const top = r.bottom + 4 + h > window.innerHeight ? Math.max(8, r.top - 4 - h) : r.bottom + 4;
-    setPos({ top, left: Math.max(8, Math.min(window.innerWidth - w - 8, r.right - w)) });
-  }, [open]);
+    const left = align === 'end' ? r.right - w : r.left;
+    setPos({ top, left: Math.max(8, Math.min(window.innerWidth - w - 8, left)) });
+  }, [open, anchor, align]);
   useEffect(() => {
     if (!open) return;
-    const close = (e: Event) => {
-      if (e instanceof KeyboardEvent && e.key !== 'Escape') return;
-      if (e.target instanceof Node && (pop.current?.contains(e.target) || btn.current?.contains(e.target))) return;
-      setOpen(false);
-    };
-    const onScroll = () => setOpen(false);
-    window.addEventListener('mousedown', close);
-    window.addEventListener('keydown', close);
+    const inside = (t: EventTarget | null) => t instanceof Node && (pop.current?.contains(t) || anchor.current?.contains(t));
+    const onDown = (e: MouseEvent) => !inside(e.target) && closeRef.current();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && closeRef.current();
+    const onScroll = (e: Event) => !(e.target instanceof Node && pop.current?.contains(e.target)) && closeRef.current();
+    const onResize = () => closeRef.current();
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey);
     window.addEventListener('scroll', onScroll, true);
-    window.addEventListener('resize', onScroll);
+    window.addEventListener('resize', onResize);
     return () => {
-      window.removeEventListener('mousedown', close);
-      window.removeEventListener('keydown', close);
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey);
       window.removeEventListener('scroll', onScroll, true);
-      window.removeEventListener('resize', onScroll);
+      window.removeEventListener('resize', onResize);
     };
-  }, [open]);
+  }, [open, anchor]);
+  if (!open) return null;
+  // Portalled to <body>: an ancestor with backdrop-filter (the top bar) would otherwise become the containing block.
+  return createPortal(
+    <div ref={pop} className={cx('menu', className)} role={role} style={pos ? { top: pos.top, left: pos.left } : { visibility: 'hidden', top: 0, left: 0 }}>
+      {children}
+    </div>,
+    document.body,
+  );
+}
+
+export function MenuButtons({ items, onDone }: { items: MenuItem[]; onDone: () => void }) {
+  return (
+    <>
+      {items.map((it) => (
+        <button
+          key={it.label}
+          type="button"
+          role="menuitem"
+          className={cx('menu-item', it.danger && 'is-danger')}
+          disabled={it.disabled}
+          onClick={() => {
+            onDone();
+            it.onSelect();
+          }}
+        >
+          {it.icon}
+          <span>{it.label}</span>
+        </button>
+      ))}
+    </>
+  );
+}
+
+/** Row "⋯" menu. */
+export function RowMenu({ items, label = 'Thao tác' }: { items: (MenuItem | false | null | undefined)[]; label?: string }) {
+  const [open, setOpen] = useState(false);
+  const btn = useRef<HTMLButtonElement>(null);
+  const list = items.filter(Boolean) as MenuItem[];
   return (
     <>
       <button
@@ -688,35 +780,124 @@ export function RowMenu({ items, label = 'Thao tác' }: { items: (MenuItem | fal
         title={label}
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => {
-          setPos(null);
-          setOpen((v) => !v);
-        }}
+        onClick={() => setOpen((v) => !v)}
       >
         <MoreHorizontal size={17} />
       </button>
-      {open && (
-        <div ref={pop} className="menu" role="menu" style={pos ? { top: pos.top, left: pos.left } : { visibility: 'hidden', top: 0, left: 0 }}>
-          {list.map((it) => (
-            <button
-              key={it.label}
-              type="button"
-              role="menuitem"
-              className={cx('menu-item', it.danger && 'is-danger')}
-              disabled={it.disabled}
-              onClick={() => {
-                setOpen(false);
-                it.onSelect();
-              }}
-            >
-              {it.icon}
-              <span>{it.label}</span>
-            </button>
-          ))}
-        </div>
-      )}
+      <Popover anchor={btn} open={open} onClose={() => setOpen(false)}>
+        <MenuButtons items={list} onDone={() => setOpen(false)} />
+      </Popover>
     </>
   );
+}
+
+/**
+ * A filter as a chip (Vanta "Event log"): "Hành động ▾" when unset, "Hành động: Đăng nhập ×" when set.
+ * The popover lists the options (with a search box for long lists).
+ */
+export function FilterChip({
+  label,
+  value,
+  options,
+  onChange,
+  icon,
+  clearable = true,
+}: {
+  label: string;
+  value: string | null;
+  options: { value: string; label: string; sub?: string }[];
+  onChange: (v: string | null) => void;
+  icon?: ReactNode;
+  /** false: one option is always selected (e.g. a time frame); the chip has no ×. */
+  clearable?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState('');
+  const btn = useRef<HTMLButtonElement>(null);
+  const current = options.find((o) => o.value === value);
+  const norm = (t: string) => t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').toLowerCase();
+  const nq = norm(q.trim());
+  const shown = nq ? options.filter((o) => norm(`${o.label} ${o.sub ?? ''}`).includes(nq)) : options;
+  const set = !!current && clearable;
+  return (
+    <span className={cx('filter-chip', set && 'is-set')}>
+      <button
+        ref={btn}
+        type="button"
+        className="filter-chip-main"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => {
+          setQ('');
+          setOpen((v) => !v);
+        }}
+      >
+        {icon}
+        <span>{label}</span>
+        {current && (
+          <>
+            <span className="filter-chip-sep" />
+            <span className="filter-chip-value truncate">{current.label}</span>
+          </>
+        )}
+        {!set && <ChevronDown size={14} />}
+      </button>
+      {set && (
+        <button type="button" className="filter-chip-clear" aria-label={`Bỏ lọc ${label}`} onClick={() => onChange(null)}>
+          <X size={13} />
+        </button>
+      )}
+      <Popover anchor={btn} open={open} onClose={() => setOpen(false)} align="start" role="listbox" className="filter-pop">
+        {options.length > 8 && (
+          <div className="filter-pop-search">
+            <SearchInput value={q} onChange={setQ} placeholder={`Tìm ${label.toLowerCase()}…`} autoFocus />
+          </div>
+        )}
+        <div className="filter-pop-list">
+          {shown.map((o) => (
+            <button
+              key={o.value}
+              type="button"
+              role="option"
+              aria-selected={o.value === value}
+              className={cx('menu-item', o.value === value && 'is-selected')}
+              onClick={() => {
+                setOpen(false);
+                onChange(o.value === value && clearable ? null : o.value);
+              }}
+            >
+              <span className="menu-check">{o.value === value && <Check size={14} />}</span>
+              <span className="truncate">{o.label}</span>
+              {o.sub && <span className="menu-sub truncate">{o.sub}</span>}
+            </button>
+          ))}
+          {!shown.length && <div className="picker-empty secondary">Không có kết quả</div>}
+        </div>
+      </Popover>
+    </span>
+  );
+}
+
+/** Key / value rows (server info, device details). */
+export function DescriptionList({ items }: { items: ({ label: ReactNode; value: ReactNode } | false | null | undefined)[] }) {
+  return (
+    <dl className="dl">
+      {(items.filter(Boolean) as { label: ReactNode; value: ReactNode }[]).map((it, i) => (
+        <div key={i} className="dl-row">
+          <dt>{it.label}</dt>
+          <dd>{it.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+export function Kbd({ children }: { children: ReactNode }) {
+  return <kbd className="kbd">{children}</kbd>;
+}
+
+export function StatusDot({ tone }: { tone: 'ok' | 'warn' | 'danger' | 'neutral' }) {
+  return <span className={cx('status-dot', tone !== 'neutral' && `is-${tone}`)} />;
 }
 
 /** Underlined page tabs (links, so they are part of the hash route). */

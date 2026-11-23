@@ -1,13 +1,14 @@
-import { useMemo, useState } from 'react';
-import { ArrowDown, ArrowUp, ArrowUpDown, KeyRound, Lock, LockOpen, MonitorSmartphone, Pencil, ShieldCheck, Trash2, UserPlus } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { KeyRound, Lock, LockOpen, MonitorSmartphone, Pencil, ScrollText, ShieldCheck, Trash2, UserPlus } from 'lucide-react';
 import { api, ApiError, type UserInput } from '../api';
 import { effective } from '../access';
 import { formatDateTime, formatRelative, isLocal, personText, sourceInfo, toDate } from '../format';
-import { navigate } from '../router';
+import { navigate, useRoute } from '../router';
+import { DataTable, type Column } from '../table';
 import type { Loaded } from '../hooks';
 import { confirmDialog, toast, toastError, useMe } from '../store';
 import type { Grant, Group, Provider, User } from '../types';
-import { Avatar, Badge, Empty, Field, FormModal, Loadable, PasswordInput, RowMenu, SearchInput, Toggle } from '../ui';
+import { Avatar, Badge, Empty, Field, FilterChip, FormModal, Loadable, PasswordInput, RowMenu, SearchInput, Toggle } from '../ui';
 
 const MIN_PASSWORD = 8;
 
@@ -33,8 +34,6 @@ const ROLE_CELL: Record<UserRoleKey, { label: string; tone: 'accent' | 'ok' | 'n
   disabled: { label: 'Đã khóa', tone: 'danger' },
 };
 
-type SortKey = 'name' | 'lastLogin';
-
 /** The "Người dùng" tab of Người dùng & nhóm (Base44 "Members and groups", Plane "Members"). */
 export function UsersTab({
   users,
@@ -52,26 +51,22 @@ export function UsersTab({
   onCreateDone: () => void;
 }) {
   const me = useMe();
-  const [q, setQ] = useState('');
+  // ⌘K → a person opens this page with ?q=<username>.
+  const routeQ = useRoute().query.get('q');
+  const [q, setQ] = useState(routeQ ?? '');
+  useEffect(() => {
+    if (routeQ !== null) setQ(routeQ);
+  }, [routeQ]);
   const [role, setRole] = useState<'' | UserRoleKey>('');
   const [source, setSource] = useState<'' | 'local' | 'ldap' | 'oidc'>('');
-  const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: 'name', dir: 1 });
   const [modal, setModal] = useState<{ kind: 'edit' | 'password'; user: User } | null>(null);
 
   const rows = useMemo(() => {
     const list = (users.data ?? [])
       .map((u) => ({ u, role: userRole(u, grants, groups), src: sourceInfo(u.source, providers) }))
       .filter((r) => (!q.trim() || matches(r.u, q.trim())) && (!role || r.role === role) && (!source || r.src.kind === source));
-    const t = (u: User) => toDate(u.lastLoginAt)?.getTime() ?? 0;
-    return list.sort((a, b) =>
-      sort.key === 'name'
-        ? sort.dir * (a.u.displayName || a.u.username).localeCompare(b.u.displayName || b.u.username)
-        : sort.dir * (t(b.u) - t(a.u)),
-    );
-  }, [users.data, grants, groups, providers, q, role, source, sort]);
-
-  const toggleSort = (key: SortKey) => setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: 1 }));
-  const sortMark = (key: SortKey) => (sort.key === key ? (sort.dir === 1 ? <ArrowDown size={13} /> : <ArrowUp size={13} />) : <ArrowUpDown size={13} className="tertiary" />);
+    return list;
+  }, [users.data, grants, groups, providers, q, role, source]);
 
   const remove = async (u: User) => {
     const ok = await confirmDialog({
@@ -109,101 +104,111 @@ export function UsersTab({
     }
   };
 
+  type Row = (typeof rows)[number];
+  const columns: Column<Row>[] = [
+    {
+      key: 'name',
+      header: 'Người dùng',
+      sort: (r) => r.u.displayName || r.u.username,
+      render: ({ u }) => (
+        <div className="cell-user">
+          <Avatar name={u.displayName || u.username} size={30} />
+          <div className="cell-text">
+            <span className="truncate">
+              {u.displayName || u.username}
+              {me?.user.id === u.id && <Badge tone="accent">Bạn</Badge>}
+            </span>
+            <span className="secondary small truncate">
+              @{u.username}
+              {u.email && <> · {u.email}</>}
+            </span>
+          </div>
+        </div>
+      ),
+    },
+    { key: 'role', header: 'Vai trò', width: 160, sort: (r) => ROLE_CELL[r.role].label, render: (r) => <Badge tone={ROLE_CELL[r.role].tone}>{ROLE_CELL[r.role].label}</Badge> },
+    {
+      key: 'src',
+      header: 'Xác thực',
+      width: 220,
+      hideBelow: 860,
+      sort: (r) => r.src.label,
+      render: (r) => <Badge tone={r.src.kind === 'local' ? 'neutral' : 'info'}>{r.src.label}</Badge>,
+    },
+    {
+      key: 'lastLogin',
+      header: 'Hoạt động gần nhất',
+      width: 170,
+      hideBelow: 860,
+      sort: (r) => toDate(r.u.lastLoginAt)?.getTime() ?? 0,
+      render: ({ u }) => (
+        <span className="cell-time secondary" title={formatDateTime(u.lastLoginAt)}>
+          {formatRelative(u.lastLoginAt)}
+        </span>
+      ),
+    },
+    {
+      key: 'actions',
+      header: '',
+      width: 48,
+      className: 'col-actions',
+      render: ({ u }) => {
+        const self = me?.user.id === u.id;
+        return (
+          <RowMenu
+            items={[
+              { label: 'Sửa thông tin', icon: <Pencil size={15} />, onSelect: () => setModal({ kind: 'edit', user: u }) },
+              isLocal(u.source) && { label: 'Đặt lại mật khẩu', icon: <KeyRound size={15} />, onSelect: () => setModal({ kind: 'password', user: u }) },
+              { label: 'Xem quyền truy cập', icon: <ShieldCheck size={15} />, onSelect: () => navigate(`/grants?user=${encodeURIComponent(u.id)}`) },
+              { label: 'Xem thiết bị', icon: <MonitorSmartphone size={15} />, onSelect: () => navigate(`/sessions?q=${encodeURIComponent(u.username)}`) },
+              { label: 'Xem nhật ký', icon: <ScrollText size={15} />, onSelect: () => navigate(`/audit?userId=${encodeURIComponent(u.id)}`) },
+              !self &&
+                (u.disabled
+                  ? { label: 'Mở khóa tài khoản', icon: <LockOpen size={15} />, onSelect: () => setDisabled(u, false) }
+                  : { label: 'Khóa tài khoản', icon: <Lock size={15} />, onSelect: () => setDisabled(u, true) }),
+              !self && { label: 'Xóa người dùng', icon: <Trash2 size={15} />, danger: true, onSelect: () => remove(u) },
+            ]}
+          />
+        );
+      },
+    },
+  ];
+
   return (
     <>
-      <div className="toolbar">
-        <SearchInput value={q} onChange={setQ} placeholder="Tìm theo tên, @username, email…" />
-        <select className="input input-auto" value={role} onChange={(e) => setRole(e.target.value as '' | UserRoleKey)} aria-label="Vai trò">
-          <option value="">Mọi vai trò</option>
-          {(Object.keys(ROLE_CELL) as UserRoleKey[]).map((k) => (
-            <option key={k} value={k}>
-              {ROLE_CELL[k].label}
-            </option>
-          ))}
-        </select>
-        <select className="input input-auto" value={source} onChange={(e) => setSource(e.target.value as typeof source)} aria-label="Xác thực">
-          <option value="">Mọi cách xác thực</option>
-          <option value="local">Nội bộ</option>
-          <option value="ldap">LDAP</option>
-          <option value="oidc">SSO</option>
-        </select>
-      </div>
       <Loadable state={users}>
-        {(all) =>
-          rows.length === 0 ? (
-            <Empty icon={<UserPlus size={28} />} title={all.length ? 'Không có người dùng khớp bộ lọc' : 'Chưa có người dùng'} />
-          ) : (
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th aria-sort={sort.key === 'name' ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}>
-                      <button type="button" className="th-sort" onClick={() => toggleSort('name')}>
-                        Người dùng {sortMark('name')}
-                      </button>
-                    </th>
-                    <th>Vai trò</th>
-                    <th>Xác thực</th>
-                    <th className="hide-sm" aria-sort={sort.key === 'lastLogin' ? (sort.dir === 1 ? 'descending' : 'ascending') : 'none'}>
-                      <button type="button" className="th-sort" onClick={() => toggleSort('lastLogin')}>
-                        Hoạt động gần nhất {sortMark('lastLogin')}
-                      </button>
-                    </th>
-                    <th className="col-actions" aria-label="Thao tác" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map(({ u, role: r, src }) => {
-                    const self = me?.user.id === u.id;
-                    return (
-                      <tr key={u.id} className={u.disabled ? 'is-muted' : undefined}>
-                        <td>
-                          <div className="cell-user">
-                            <Avatar name={u.displayName || u.username} size={34} />
-                            <div className="cell-text">
-                              <span className="truncate">
-                                {u.displayName || u.username}
-                                {self && <Badge tone="accent">Bạn</Badge>}
-                              </span>
-                              <span className="secondary small truncate">
-                                @{u.username}
-                                {u.email && <> · {u.email}</>}
-                              </span>
-                            </div>
-                          </div>
-                        </td>
-                        <td>
-                          <Badge tone={ROLE_CELL[r].tone}>{ROLE_CELL[r].label}</Badge>
-                        </td>
-                        <td>
-                          <Badge tone={src.kind === 'local' ? 'neutral' : 'info'}>{src.label}</Badge>
-                        </td>
-                        <td className="hide-sm nowrap" title={formatDateTime(u.lastLoginAt)}>
-                          {formatRelative(u.lastLoginAt)}
-                        </td>
-                        <td className="col-actions">
-                          <RowMenu
-                            items={[
-                              { label: 'Sửa thông tin', icon: <Pencil size={15} />, onSelect: () => setModal({ kind: 'edit', user: u }) },
-                              isLocal(u.source) && { label: 'Đặt lại mật khẩu', icon: <KeyRound size={15} />, onSelect: () => setModal({ kind: 'password', user: u }) },
-                              { label: 'Xem quyền truy cập', icon: <ShieldCheck size={15} />, onSelect: () => navigate(`/grants?user=${encodeURIComponent(u.id)}`) },
-                              { label: 'Xem thiết bị', icon: <MonitorSmartphone size={15} />, onSelect: () => navigate(`/sessions?q=${encodeURIComponent(u.username)}`) },
-                              !self &&
-                                (u.disabled
-                                  ? { label: 'Mở khóa tài khoản', icon: <LockOpen size={15} />, onSelect: () => setDisabled(u, false) }
-                                  : { label: 'Khóa tài khoản', icon: <Lock size={15} />, onSelect: () => setDisabled(u, true) }),
-                              !self && { label: 'Xóa người dùng', icon: <Trash2 size={15} />, danger: true, onSelect: () => remove(u) },
-                            ]}
-                          />
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )
-        }
+        {(all) => (
+          <DataTable
+            rows={rows}
+            columns={columns}
+            rowKey={(r) => r.u.id}
+            defaultSort={{ key: 'name', dir: 'asc' }}
+            rowClassName={(r) => r.u.disabled && 'is-muted'}
+            toolbar={
+              <>
+                <SearchInput value={q} onChange={setQ} placeholder="Tìm theo tên, @username, email…" />
+                <FilterChip
+                  label="Vai trò"
+                  value={role || null}
+                  options={(Object.keys(ROLE_CELL) as UserRoleKey[]).map((k) => ({ value: k, label: ROLE_CELL[k].label }))}
+                  onChange={(v) => setRole((v ?? '') as '' | UserRoleKey)}
+                />
+                <FilterChip
+                  label="Xác thực"
+                  value={source || null}
+                  options={[
+                    { value: 'local', label: 'Nội bộ' },
+                    { value: 'ldap', label: 'LDAP' },
+                    { value: 'oidc', label: 'SSO' },
+                  ]}
+                  onChange={(v) => setSource((v ?? '') as typeof source)}
+                />
+              </>
+            }
+            count={rows.length === all.length ? `${all.length} người dùng` : `${rows.length} / ${all.length} người dùng`}
+            empty={<Empty icon={<UserPlus size={22} />} title={all.length ? 'Không có người dùng khớp bộ lọc' : 'Chưa có người dùng'} />}
+          />
+        )}
       </Loadable>
       {creating && (
         <CreateUser

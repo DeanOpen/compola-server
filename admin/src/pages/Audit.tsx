@@ -1,26 +1,52 @@
-// Nhật ký: a filter bar (time frame, person, IP, event type) over rows that read as sentences and expand to the
-// raw entry (Customer.io "Audit Logs"; the person column and the time-frame chip from Klaviyo "Activity log").
+// Nhật ký: filter chips (time frame, person, event type, IP) over a table whose rows read as sentences and expand to
+// the raw entry (Vanta "Event log", 1Password "Activity log"); CSV export of the loaded rows.
 import { useMemo, useState } from 'react';
-import { ChevronRight, RefreshCw, ScrollText } from 'lucide-react';
+import { CalendarDays, ChevronRight, Download, RefreshCw, ScrollText } from 'lucide-react';
 import { api } from '../api';
 import { actorUser, AuditSentence, auditDetail } from '../auditView';
-import { ACTION_FILTERS, actionLabel, actionTone, formatDateTime, formatRelative, personText, toDate } from '../format';
+import { ACTION_FILTERS, actionLabel, actionTone, detailText, formatDateTime, formatRelative, toDate } from '../format';
 import { useLoad } from '../hooks';
 import { toastError } from '../store';
 import type { AuditEntry, User } from '../types';
-import { Avatar, Badge, Button, cx, Empty, Loadable, PageHeader, Segmented } from '../ui';
+import { useRoute } from '../router';
+import { DataTable, type Column } from '../table';
+import { Badge, Button, Empty, FilterChip, Loadable, PageHeader, Person } from '../ui';
 
 const PAGE = 100;
 
 type Frame = '24h' | '7d' | '30d' | 'all';
 const FRAME_MS: Record<Frame, number> = { '24h': 86_400_000, '7d': 7 * 86_400_000, '30d': 30 * 86_400_000, all: Infinity };
 
+const FRAMES: { value: Frame; label: string }[] = [
+  { value: '24h', label: '24 giờ qua' },
+  { value: '7d', label: '7 ngày qua' },
+  { value: '30d', label: '30 ngày qua' },
+  { value: 'all', label: 'Mọi lúc' },
+];
+
+/** Loaded rows as CSV (Excel-friendly: UTF-8 BOM, quoted fields). */
+function toCsv(entries: AuditEntry[]): string {
+  const q = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const head = ['Thời gian', 'Người thực hiện', 'Hành động', 'Mã hành động', 'Đối tượng', 'IP', 'Chi tiết'];
+  const rows = entries.map((e) => [formatDateTime(e.at), e.actor?.username ?? '', actionLabel(e.action), e.action, e.target, e.ip, detailText(e.detail)].map(q).join(','));
+  return '﻿' + [head.map(q).join(','), ...rows].join('\r\n');
+}
+
+function download(name: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export function AuditPage() {
-  const [userId, setUserId] = useState('');
-  const [action, setAction] = useState('');
+  const route = useRoute();
+  const [userId, setUserId] = useState(route.query.get('userId') ?? '');
+  const [action, setAction] = useState(route.query.get('action') ?? '');
   const [ip, setIp] = useState('');
   const [frame, setFrame] = useState<Frame>('7d');
-  const [open, setOpen] = useState<Set<AuditEntry['id']>>(new Set());
   const users = useLoad<User[]>(() => api.users().catch(() => []), []);
   const [more, setMore] = useState<{ entries: AuditEntry[]; done: boolean }>({ entries: [], done: false });
   const [loadingMore, setLoadingMore] = useState(false);
@@ -52,15 +78,50 @@ export function AuditPage() {
     }
   };
 
-  const toggle = (id: AuditEntry['id']) =>
-    setOpen((s) => {
-      const n = new Set(s);
-      if (n.has(id)) n.delete(id);
-      else n.add(id);
-      return n;
-    });
-
   const filtered = !!(userId || action || ip.trim());
+  const people = (users.data ?? [])
+    .slice()
+    .sort((a, b) => a.username.localeCompare(b.username))
+    .map((u) => ({ value: u.id, label: u.displayName || u.username, sub: `@${u.username}` }));
+
+  const columns: Column<AuditEntry>[] = [
+    {
+      key: 'at',
+      header: 'Thời gian',
+      width: 150,
+      render: (e) => (
+        <span className="cell-time" title={formatRelative(e.at)}>
+          {formatDateTime(e.at)}
+        </span>
+      ),
+    },
+    {
+      key: 'actor',
+      header: 'Người thực hiện',
+      width: 200,
+      hideBelow: 860,
+      render: (e) => {
+        const actor = actorUser(e, userById);
+        return actor ? <Person user={actor} size={24} /> : <span className="tertiary">Chưa đăng nhập</span>;
+      },
+    },
+    { key: 'action', header: 'Hành động', width: 180, render: (e) => <Badge tone={actionTone(e.action)}>{actionLabel(e.action)}</Badge> },
+    {
+      key: 'what',
+      header: 'Chi tiết',
+      render: (e) => {
+        const detail = auditDetail(e);
+        return (
+          <span className="audit-cell">
+            <AuditSentence entry={e} userById={userById} />
+            {detail && <span className="secondary small truncate">{detail}</span>}
+          </span>
+        );
+      },
+    },
+    { key: 'ip', header: 'IP', width: 130, hideBelow: 1100, render: (e) => <span className="cell-mono">{e.ip || '—'}</span> },
+    { key: 'chev', header: '', width: 36, render: () => <ChevronRight size={15} className="audit-chevron" /> },
+  ];
 
   return (
     <div className="page">
@@ -68,115 +129,70 @@ export function AuditPage() {
         title="Nhật ký"
         subtitle="Ai đã làm gì: đăng nhập, thay đổi cấu hình, thiết bị và thao tác trên tài khoản Zalo"
         actions={
-          <Button icon={<RefreshCw size={16} />} busy={first.loading} onClick={() => first.reload()}>
-            Làm mới
-          </Button>
+          <>
+            <Button icon={<RefreshCw size={15} />} busy={first.loading} onClick={() => first.reload()}>
+              Làm mới
+            </Button>
+            <Button icon={<Download size={15} />} disabled={!entries.length} onClick={() => download(`compola-nhat-ky-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(entries))}>
+              Xuất CSV
+            </Button>
+          </>
         }
       />
-      <div className="filter-bar">
-        <Segmented<Frame>
-          value={frame}
-          onChange={setFrame}
-          options={[
-            { value: '24h', label: '24 giờ' },
-            { value: '7d', label: '7 ngày' },
-            { value: '30d', label: '30 ngày' },
-            { value: 'all', label: 'Mọi lúc' },
-          ]}
-        />
-        <select className="input input-auto" value={userId} onChange={(e) => setUserId(e.target.value)} aria-label="Người thực hiện">
-          <option value="">Mọi người</option>
-          {(users.data ?? [])
-            .slice()
-            .sort((a, b) => a.username.localeCompare(b.username))
-            .map((u) => (
-              <option key={u.id} value={u.id}>
-                {personText(u)}
-              </option>
-            ))}
-        </select>
-        <select className="input input-auto" value={action} onChange={(e) => setAction(e.target.value)} aria-label="Loại sự kiện">
-          <option value="">Mọi sự kiện</option>
-          {ACTION_FILTERS.map((a) => (
-            <option key={a.value} value={a.value}>
-              {a.label}
-            </option>
-          ))}
-        </select>
-        <input className="input input-ip mono" value={ip} placeholder="IP" spellCheck={false} onChange={(e) => setIp(e.target.value)} aria-label="Lọc theo IP" />
-        {filtered && (
-          <button
-            type="button"
-            className="link small"
-            onClick={() => {
-              setUserId('');
-              setAction('');
-              setIp('');
-            }}
-          >
-            Xóa bộ lọc
-          </button>
-        )}
-      </div>
       <Loadable state={first}>
-        {() =>
-          entries.length === 0 ? (
-            <>
-              <Empty icon={<ScrollText size={28} />} title="Không có sự kiện nào">
+        {() => (
+          <DataTable
+            className="audit-table"
+            rows={entries}
+            columns={columns}
+            rowKey={(e) => String(e.id)}
+            pageSize={0}
+            expand={(e) => (
+              <pre className="audit-json selectable">
+                {JSON.stringify({ id: e.id, at: formatDateTime(e.at), actor: e.actor, action: e.action, target: e.target, ip: e.ip, detail: e.detail }, null, 2)}
+              </pre>
+            )}
+            toolbar={
+              <>
+                <FilterChip label="Thời gian" icon={<CalendarDays size={14} />} value={frame} clearable={false} options={FRAMES} onChange={(v) => setFrame((v as Frame) ?? '7d')} />
+                <FilterChip label="Người thực hiện" value={userId || null} options={people} onChange={(v) => setUserId(v ?? '')} />
+                <FilterChip label="Hành động" value={action || null} options={ACTION_FILTERS} onChange={(v) => setAction(v ?? '')} />
+                <input className="input input-ip mono" value={ip} placeholder="Lọc theo IP" spellCheck={false} onChange={(e) => setIp(e.target.value)} aria-label="Lọc theo IP" />
+                {filtered && (
+                  <button
+                    type="button"
+                    className="link small"
+                    onClick={() => {
+                      setUserId('');
+                      setAction('');
+                      setIp('');
+                    }}
+                  >
+                    Xóa bộ lọc
+                  </button>
+                )}
+              </>
+            }
+            count={`${entries.length} sự kiện`}
+            empty={
+              <Empty icon={<ScrollText size={22} />} title="Không có sự kiện nào">
                 {frame !== 'all' ? 'Thử chọn khoảng thời gian dài hơn.' : undefined}
               </Empty>
-              {!exhausted && (
-                <div className="center-actions">
-                  <Button busy={loadingMore} onClick={loadMore}>
+            }
+            footer={
+              <>
+                <span className="secondary">
+                  {exhausted ? `Đã hiện hết ${entries.length} sự kiện${frame !== 'all' ? ' trong khoảng thời gian này' : ''}` : `Đang hiện ${entries.length} sự kiện mới nhất`}
+                </span>
+                {!exhausted && (
+                  <Button size="sm" busy={loadingMore} onClick={loadMore}>
                     Tải thêm sự kiện cũ hơn
                   </Button>
-                </div>
-              )}
-            </>
-          ) : (
-            <>
-              <div className="card audit-list">
-                {entries.map((e) => {
-                  const actor = actorUser(e, userById);
-                  const expanded = open.has(e.id);
-                  const detail = auditDetail(e);
-                  return (
-                    <div key={e.id} className={cx('audit-row', expanded && 'is-open')}>
-                      <button type="button" className="audit-main" onClick={() => toggle(e.id)} aria-expanded={expanded}>
-                        <Avatar name={actor ? actor.displayName || actor.username : '?'} size={32} />
-                        <span className="audit-body">
-                          <AuditSentence entry={e} userById={userById} />
-                          <span className="audit-meta">
-                            <Badge tone={actionTone(e.action)}>{actionLabel(e.action)}</Badge>
-                            <span title={formatDateTime(e.at)}>{formatRelative(e.at)}</span>
-                            <span className="mono">{e.ip || '—'}</span>
-                            {detail && <span className="truncate audit-detail-inline">{detail}</span>}
-                          </span>
-                        </span>
-                        <span className="audit-time hide-sm">{formatDateTime(e.at)}</span>
-                        <ChevronRight size={16} className="audit-chevron" />
-                      </button>
-                      {expanded && (
-                        <pre className="audit-json selectable">
-                          {JSON.stringify({ id: e.id, at: formatDateTime(e.at), actor: e.actor, action: e.action, target: e.target, ip: e.ip, detail: e.detail }, null, 2)}
-                        </pre>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-              <div className="center-actions">
-                {exhausted ? (
-                  <span className="secondary small">Đã hiện hết {entries.length} sự kiện{frame !== 'all' ? ' trong khoảng thời gian này' : ''}</span>
-                ) : (
-                  <Button busy={loadingMore} onClick={loadMore}>
-                    Xem thêm
-                  </Button>
                 )}
-              </div>
-            </>
-          )
-        }
+              </>
+            }
+          />
+        )}
       </Loadable>
     </div>
   );

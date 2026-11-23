@@ -1,5 +1,5 @@
 // Vietnamese labels and formatting.
-import type { MeRole, Provider, Scope, Timestamp, UserSource } from './types';
+import type { MeRole, Provider, ServerInfo, Scope, Timestamp, UserSource } from './types';
 
 export function toDate(t: Timestamp | null | undefined): Date | null {
   if (t === null || t === undefined || t === '') return null;
@@ -179,4 +179,12 @@ export function personText(u: { username: string; displayName?: string } | null 
 
 export function deviceKindLabel(kind: string): string {
   return kind === 'web' ? 'Trình duyệt · trang quản trị' : 'Ứng dụng Compola';
+}
+
+/** One-line health of the server for the sidebar footer and the overview. */
+export function serverHealth(s: ServerInfo): { tone: 'ok' | 'warn' | 'danger'; label: string } {
+  if (!s.account) return { tone: 'warn', label: 'Chưa đăng nhập Zalo' };
+  const tone = phaseTone(s.account.phase);
+  const label = PHASE_LABEL[s.account.phase] ?? s.account.phase;
+  return { tone: tone === 'ok' ? 'ok' : tone === 'danger' ? 'danger' : 'warn', label };
 }
