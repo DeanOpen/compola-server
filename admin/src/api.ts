@@ -17,6 +17,7 @@ import type {
   ServerInfo,
   Session,
   User,
+  ZaloStatus,
 } from './types';
 
 export class ApiError extends Error {
@@ -235,6 +236,12 @@ export const api = {
     if (q.action) p.set('action', q.action);
     return request<unknown>('GET', `/api/admin/audit?${p}`).then((r) => list<AuditEntry>(r, 'entries', 'audit'));
   },
+
+  // The host's Zalo account
+  zalo: () => request<ZaloStatus>('GET', '/api/admin/zalo'),
+  zaloQr: () => request<unknown>('POST', '/api/admin/zalo/qr', {}),
+  zaloLogout: () => request<unknown>('POST', '/api/admin/zalo/logout', {}),
+  zaloRetry: () => request<unknown>('POST', '/api/admin/zalo/retry', {}),
 
   // Server
   server: () => request<ServerInfo>('GET', '/api/admin/server'),

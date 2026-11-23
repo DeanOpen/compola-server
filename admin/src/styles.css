@@ -2603,3 +2603,284 @@ body.modal-open .mock-banner {
     margin-left: 46px;
   }
 }
+
+/* ---------- Tài khoản Zalo (QR card as the desktop LoginView) ---------- */
+
+.zalo-card {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 460px;
+  width: 100%;
+  margin: 0 auto;
+}
+.zalo-lead {
+  font-weight: 600;
+  font-size: 15px;
+  text-align: center;
+}
+.zalo-ready {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+}
+.zalo-ready-text {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.zalo-foot {
+  display: flex;
+  justify-content: center;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.zalo-wait {
+  align-items: center;
+  text-align: center;
+}
+.zalo-wait .spinner-wrap {
+  padding: 8px;
+}
+.login-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+.login-body > .notice {
+  align-self: stretch;
+}
+.login-qr-box {
+  width: 240px;
+  height: 240px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  display: grid;
+  place-items: center;
+  background: #fff;
+  position: relative;
+  overflow: hidden;
+}
+.login-qr-box.is-panel {
+  background: var(--surface-2);
+}
+.login-qr {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: #5a6981;
+}
+.login-qr-code {
+  width: 212px;
+  height: 212px;
+  image-rendering: pixelated;
+}
+.login-qr-code.is-expired {
+  filter: blur(3px);
+  opacity: 0.35;
+}
+.login-expired {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.55);
+}
+.login-expired-title {
+  font-weight: 600;
+  color: #081b3a;
+}
+.login-confirm {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  text-align: center;
+}
+.login-confirm-avatar {
+  position: relative;
+  display: inline-flex;
+}
+.login-confirm-badge {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 0 0 3px var(--surface-2);
+}
+.login-confirm-name {
+  font-weight: 600;
+  font-size: 15px;
+}
+.login-waiting {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.login-fail-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.login-caption {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+.login-caption.is-muted {
+  color: var(--text-tertiary);
+}
+.login-caption.is-error {
+  color: var(--danger);
+}
+.login-steps {
+  align-self: stretch;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.login-steps li {
+  counter-increment: step;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13.5px;
+}
+.login-steps li::before {
+  content: counter(step);
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.login-trust {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.runtime {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.runtime-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.runtime-step {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+}
+.runtime-step:first-child {
+  border-top: 0;
+}
+.runtime-step.is-running {
+  background: var(--accent-soft);
+}
+.runtime-step.is-waiting {
+  color: var(--text-tertiary);
+}
+.runtime-step-mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: var(--neutral-soft);
+}
+.runtime-step.is-done .runtime-step-mark {
+  background: var(--ok);
+  color: #fff;
+}
+.runtime-step.is-running .runtime-step-mark {
+  color: var(--accent-text);
+  background: var(--surface);
+}
+.runtime-step.is-failed .runtime-step-mark {
+  background: var(--danger);
+  color: #fff;
+}
+.runtime-step-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.runtime-step-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.runtime-bar {
+  width: 100%;
+  height: 6px;
+  appearance: none;
+  border: 0;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--neutral-soft);
+}
+.runtime-bar::-webkit-progress-bar {
+  background: var(--neutral-soft);
+}
+.runtime-bar::-webkit-progress-value {
+  background: var(--accent);
+}
+.runtime-bar::-moz-progress-bar {
+  background: var(--accent);
+}
+.zalo-status-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--warn-soft);
+  color: var(--warn);
+  flex-shrink: 0;
+}

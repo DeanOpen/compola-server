@@ -186,3 +186,44 @@ export interface DeviceInfo {
   ip: string;
   createdAt: Timestamp;
 }
+
+// ---- The host's Zalo account (engine phase, as src-tauri/src/engine.rs `Phase` serializes it) ----
+
+export type RuntimeStep = 'looking' | 'downloading' | 'verifying' | 'installing';
+
+export interface RuntimeSetup {
+  step: RuntimeStep;
+  received?: number | null;
+  total?: number | null;
+  /** Why the last attempt failed; offer "Thử lại" (POST /api/admin/zalo/retry). */
+  failure?: string | null;
+}
+
+export type LoginStep =
+  | { kind: 'generating' }
+  | { kind: 'waitingScan' }
+  /** Phone scanned; waiting for "Đăng nhập" on the phone. */
+  | { kind: 'waitingConfirm'; name: string; avatar?: string | null }
+  | { kind: 'expired' }
+  | { kind: 'failed'; message: string };
+
+export interface LoginState {
+  step: LoginStep;
+  /** A data URL (PNG or SVG). */
+  qr: string | null;
+  /** The server asked for a second scan (device linking). */
+  isSecondQr: boolean;
+}
+
+export type ZaloPhase =
+  | { kind: 'starting' }
+  | { kind: 'preparing'; setup: RuntimeSetup }
+  | { kind: 'login'; login: LoginState; notice?: string | null }
+  | { kind: 'signingIn' }
+  | { kind: 'ready' };
+
+export interface ZaloStatus {
+  /** null before the engine reported its first phase. */
+  phase: ZaloPhase | null;
+  account: { name: string; avatar: string; phase: string } | null;
+}

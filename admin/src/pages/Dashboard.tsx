@@ -1,6 +1,6 @@
-import { AlertTriangle, ArrowRight, MonitorSmartphone, Network, Server, Users } from 'lucide-react';
+import { AlertTriangle, ArrowRight, MessageCircle, MonitorSmartphone, Network, Server, Users } from 'lucide-react';
 import { api } from '../api';
-import { actionLabel, actionTone, formatRelative, PHASE_LABEL, phaseTone } from '../format';
+import { actionLabel, actionTone, formatRelative, PHASE_LABEL } from '../format';
 import { useInterval, useLoad } from '../hooks';
 import type { Address, Session } from '../types';
 import { AuditSentence } from '../auditView';
@@ -18,6 +18,7 @@ export function DashboardPage() {
   useInterval(() => {
     void sessions.reload();
     void audit.reload();
+    void server.reload();
   }, 20000);
 
   const online = sessions.data?.filter((s) => s.online) ?? [];
@@ -62,19 +63,30 @@ export function DashboardPage() {
               <Stat label="Cổng" icon={<Network size={18} />} value={s.listen.port} sub={s.listen.allowNetwork ? 'Mở cho mạng LAN' : 'Chỉ máy này'} />
             </div>
             <div className="grid-2">
-              <Card title="Tài khoản Zalo">
-                {s.account ? (
+              <Card title="Tài khoản Zalo" actions={<a className="link small" href="#/zalo">Quản lý</a>}>
+                {s.account?.phase === 'ready' ? (
                   <div className="profile">
                     <Avatar name={s.account.name || 'Zalo'} src={s.account.avatar} size={52} />
                     <div className="profile-text">
-                      <h2>{s.account.name || 'Chưa có tên'}</h2>
-                      <Badge tone={phaseTone(s.account.phase)} dot>
-                        {PHASE_LABEL[s.account.phase] ?? s.account.phase}
+                      <h2>{s.account.name || 'Tài khoản Zalo'}</h2>
+                      <Badge tone="ok" dot>
+                        Đã đăng nhập
                       </Badge>
                     </div>
                   </div>
                 ) : (
-                  <p className="secondary">Máy chủ chưa đăng nhập tài khoản Zalo.</p>
+                  <div className="profile">
+                    <span className="zalo-status-icon">
+                      <MessageCircle size={24} />
+                    </span>
+                    <div className="profile-text">
+                      <h2>{s.account?.phase === 'login' ? 'Chưa đăng nhập Zalo' : PHASE_LABEL[s.account?.phase ?? ''] ?? 'Đang khởi động'}</h2>
+                      <span className="secondary small">Người dùng Compola Server chưa dùng được tài khoản cho tới khi máy chủ đăng nhập.</span>
+                      <a className="btn btn-primary btn-sm" href="#/zalo">
+                        {s.account?.phase === 'login' ? 'Đăng nhập bằng mã QR' : 'Xem trạng thái'}
+                      </a>
+                    </div>
+                  </div>
                 )}
               </Card>
               <Card title="Máy chủ" actions={<a className="link small" href="#/settings">Cài đặt</a>}>

@@ -1,7 +1,7 @@
 // In-memory Compola Server for `npm run dev:admin` with `?mock=1`: every endpoint of docs/compola-server.md, enough
 // to click through all screens. Loaded with a dynamic import only in mock mode; not part of a production build.
 import { effective } from './access';
-import type { AuditEntry, Conversation, Grant, Group, Label, Provider, ServerInfo, Session, User } from './types';
+import type { AuditEntry, Conversation, Grant, Group, Label, Provider, ServerInfo, Session, User, ZaloPhase } from './types';
 
 type Res = { status: number; body: unknown };
 
@@ -129,6 +129,8 @@ const audit: AuditEntry[] = [];
   const lanMac = sessions[1];
   const sample: [string, string, string, Record<string, unknown> | null][] = [
     ['admin', 'login', 'Tài khoản nội bộ', { method: 'password' }],
+    ['khoa', 'login', 'link', { method: 'one-time link' }],
+    ['admin', 'zalo.logout', 'Shop Compola', {}],
     ['lan', 'message.send', conversations[0].name, null],
     ['minh', 'denied', 'call.message.send', { reason: 'Vai trò người xem' }],
     ['admin', 'grant.update', 'Nhóm Chăm sóc khách hàng', { role: 'agent' }],
@@ -164,6 +166,95 @@ const server: ServerInfo = {
   listen: { port: 39218, allowNetwork: true },
   addresses: [{ ip: '192.168.1.20', kind: 'lan' }, { ip: '10.8.0.1', kind: 'vpn' }],
 };
+
+// ---- The host's Zalo account ----
+// Starts signed in; "Đăng xuất Zalo" (or `?mock=1&zalo=login`) starts a QR cycle: generating → waitingScan (9 s) →
+// waitingConfirm (6 s) → signingIn (3 s) → ready. `&zalo=expired|failed|second|notice|preparing|preparing-failed|starting`
+// pins one state for screenshots (also `confirm`).
+
+function fakeQr(seed: number): string {
+  const n = 29;
+  let x = seed || 1;
+  const rnd = () => ((x = (x * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const finder = (r: number, c: number) => {
+    const inBox = (r0: number, c0: number) => r >= r0 && r < r0 + 7 && c >= c0 && c < c0 + 7;
+    for (const [r0, c0] of [[0, 0], [0, n - 7], [n - 7, 0]]) {
+      if (inBox(r0, c0)) {
+        const rr = r - r0;
+        const cc = c - c0;
+        return rr === 0 || rr === 6 || cc === 0 || cc === 6 || (rr >= 2 && rr <= 4 && cc >= 2 && cc <= 4) ? 1 : 0;
+      }
+      if (r >= r0 - 1 && r <= r0 + 7 && c >= c0 - 1 && c <= c0 + 7) return 0;
+    }
+    return -1;
+  };
+  let rects = '';
+  for (let r = 0; r < n; r++)
+    for (let c = 0; c < n; c++) {
+      const f = finder(r, c);
+      if (f === 1 || (f === -1 && rnd() > 0.52)) rects += `<rect x="${c}" y="${r}" width="1" height="1"/>`;
+    }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -2 ${n + 4} ${n + 4}" shape-rendering="crispEdges"><rect x="-2" y="-2" width="${n + 4}" height="${n + 4}" fill="#fff"/><g fill="#081b3a">${rects}</g></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+const zaloPin = (() => {
+  try {
+    return new URLSearchParams(window.location.search).get('zalo');
+  } catch {
+    return null;
+  }
+})();
+let zaloCycle: number | null = zaloPin === 'login' ? Date.now() : null; // start of the current QR cycle; null = signed in
+let qrSeed = 7;
+const prepStart = Date.now();
+
+function zaloPhase(): ZaloPhase {
+  const qr = fakeQr(qrSeed);
+  const login = (step: Extract<ZaloPhase, { kind: 'login' }>['login']['step'], extra: Partial<Extract<ZaloPhase, { kind: 'login' }>> = {}, isSecondQr = false): ZaloPhase => ({
+    kind: 'login',
+    login: { step, qr, isSecondQr },
+    notice: null,
+    ...extra,
+  });
+  switch (zaloPin) {
+    case 'expired':
+      return login({ kind: 'expired' });
+    case 'failed':
+      return login({ kind: 'failed', message: 'Không kết nối được máy chủ Zalo. Kiểm tra mạng của máy chủ rồi thử lại.' });
+    case 'confirm':
+      return login({ kind: 'waitingConfirm', name: 'Shop Compola', avatar: '' });
+    case 'second':
+      return login({ kind: 'waitingScan' }, {}, true);
+    case 'notice':
+      return login({ kind: 'waitingScan' }, { notice: 'Zalo đã đăng xuất phiên này (đăng nhập trên máy khác). Quét mã để đăng nhập lại.' });
+    case 'starting':
+      return { kind: 'starting' };
+    case 'preparing':
+    case 'preparing-failed': {
+      const total = 340_000_000;
+      const received = Math.min(total, ((Date.now() - prepStart) / 20_000) * total);
+      return zaloPin === 'preparing'
+        ? { kind: 'preparing', setup: { step: 'downloading', received, total } }
+        : { kind: 'preparing', setup: { step: 'downloading', received: 121_400_000, total, failure: 'Tải phần lõi Zalo PC thất bại: kết nối bị ngắt (HTTP 503).' } };
+    }
+  }
+  if (zaloCycle === null) return { kind: 'ready' };
+  const t = Date.now() - zaloCycle;
+  if (t < 600) return { kind: 'login', login: { step: { kind: 'generating' }, qr: null, isSecondQr: false }, notice: null };
+  if (t < 10_000) return login({ kind: 'waitingScan' });
+  if (t < 16_000) return login({ kind: 'waitingConfirm', name: server.account?.name ?? 'Shop Compola', avatar: '' });
+  if (t < 19_000) return { kind: 'signingIn' };
+  zaloCycle = null;
+  return { kind: 'ready' };
+}
+
+function zaloStatus() {
+  const phase = zaloPhase();
+  const account = { name: phase.kind === 'ready' ? 'Shop Compola' : '', avatar: '', phase: phase.kind };
+  server.account = account;
+  return { phase, account };
+}
 
 const STORAGE_KEY = 'compola-admin-mock-user';
 // `?mock=1&as=<username>` starts signed in (handy for screenshots).
@@ -451,7 +542,28 @@ export async function handle(method: string, rawPath: string, body: unknown): Pr
       const rows = audit.filter((e) => (!before || Number(e.id) < Number(before)) && (!userId || e.actor?.userId === userId) && (!action || e.action === action));
       return ok(rows.slice(0, limit));
     }
+    case 'zalo': {
+      if (method === 'GET') return ok(zaloStatus());
+      if (method === 'POST' && id === 'qr') {
+        qrSeed++;
+        if (zaloCycle !== null) zaloCycle = Date.now();
+        log('zalo.qr', '', {});
+        return ok();
+      }
+      if (method === 'POST' && id === 'logout') {
+        log('zalo.logout', server.account?.name ?? '', {});
+        zaloCycle = Date.now();
+        qrSeed++;
+        return ok();
+      }
+      if (method === 'POST' && id === 'retry') {
+        log('zalo.retry', '', {});
+        return ok();
+      }
+      break;
+    }
     case 'server': {
+      zaloStatus();
       if (method === 'GET') return ok(server);
       if (method === 'PATCH') {
         if (typeof b.name === 'string') server.name = b.name;

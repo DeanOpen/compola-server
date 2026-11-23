@@ -89,6 +89,9 @@ export const ACTION_LABEL: Record<string, string> = {
   'device.deny': 'Từ chối thiết bị',
   'server.update': 'Sửa cài đặt máy chủ',
   'message.send': 'Gửi tin nhắn',
+  'zalo.qr': 'Lấy mã QR Zalo mới',
+  'zalo.logout': 'Đăng xuất Zalo',
+  'zalo.retry': 'Chuẩn bị lại phần lõi Zalo',
   denied: 'Bị chặn bởi phân quyền',
 };
 
@@ -104,6 +107,7 @@ export const ACTION_FILTERS: { value: string; label: string }[] = [
   { value: 'grant', label: 'Phân quyền (mọi thay đổi)' },
   { value: 'provider', label: 'Nguồn đăng nhập (mọi thay đổi)' },
   { value: 'server', label: 'Cài đặt máy chủ' },
+  { value: 'zalo', label: 'Tài khoản Zalo của máy chủ' },
   { value: 'message.send', label: 'Gửi tin nhắn' },
   { value: 'call', label: 'Thao tác trên Zalo (mọi)' },
   { value: 'denied', label: 'Bị chặn bởi phân quyền' },
@@ -122,6 +126,7 @@ export function actionTone(action: string): ActionTone {
   if (action === 'denied' || action === 'login.failed') return 'danger';
   if (action.endsWith('.delete') || action === 'session.revoke') return 'warn';
   if (action === 'login' || action === 'device.approve') return 'ok';
+  if (action === 'zalo.logout') return 'warn';
   if (action.startsWith('call.') || action === 'message.send') return 'info';
   return 'neutral';
 }
@@ -134,7 +139,9 @@ export const PHASE_LABEL: Record<string, string> = {
   loading: 'Đang tải',
   starting: 'Đang khởi động',
   connecting: 'Đang kết nối',
-  login: 'Chờ đăng nhập Zalo',
+  login: 'Chờ quét mã QR',
+  preparing: 'Đang chuẩn bị phần lõi Zalo',
+  signingIn: 'Đang đăng nhập',
   qr: 'Chờ quét mã QR',
   signedOut: 'Chưa đăng nhập Zalo',
   loggedOut: 'Chưa đăng nhập Zalo',
@@ -179,4 +186,17 @@ export function personText(u: { username: string; displayName?: string } | null 
 
 export function deviceKindLabel(kind: string): string {
   return kind === 'web' ? 'Trình duyệt · trang quản trị' : 'Ứng dụng Compola';
+}
+
+/** "12,3 MB" (decimal units), as the desktop app's runtime setup shows sizes. */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1000) return `${bytes} byte`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1000;
+  let i = 0;
+  while (value >= 1000 && i < units.length - 1) {
+    value /= 1000;
+    i += 1;
+  }
+  return `${value.toLocaleString('vi-VN', { maximumFractionDigits: value < 100 ? 1 : 0 })} ${units[i]}`;
 }

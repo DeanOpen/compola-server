@@ -5,6 +5,7 @@ import {
   LayoutDashboard,
   LogOut,
   Menu,
+  MessageCircle,
   MonitorSmartphone,
   ScrollText,
   Settings,
@@ -29,6 +30,7 @@ import { ProvidersPage } from './pages/Providers';
 import { SessionsPage } from './pages/Sessions';
 import { AuditPage } from './pages/Audit';
 import { SettingsPage } from './pages/Settings';
+import { ZaloPage } from './pages/Zalo';
 
 interface NavItem {
   path: string;
@@ -57,7 +59,13 @@ const NAV_SECTIONS: { label: string | null; items: NavItem[] }[] = [
       { path: '/audit', label: 'Nhật ký', icon: <ScrollText size={18} />, render: () => <AuditPage /> },
     ],
   },
-  { label: 'Máy chủ', items: [{ path: '/settings', label: 'Cài đặt máy chủ', icon: <Settings size={18} />, render: () => <SettingsPage /> }] },
+  {
+    label: 'Máy chủ',
+    items: [
+      { path: '/zalo', label: 'Tài khoản Zalo', icon: <MessageCircle size={18} />, render: () => <ZaloPage /> },
+      { path: '/settings', label: 'Cài đặt máy chủ', icon: <Settings size={18} />, render: () => <SettingsPage /> },
+    ],
+  },
 ];
 const ADMIN_NAV: NavItem[] = NAV_SECTIONS.flatMap((s) => s.items);
 const matches = (n: NavItem, path: string) => n.path === path || !!n.also?.includes(path);

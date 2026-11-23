@@ -30,6 +30,7 @@ const VALUE_LABEL: Record<string, string> = {
   password: 'mật khẩu',
   sso: 'SSO',
   'owner-link': 'liên kết của chủ máy',
+  'one-time link': 'liên kết một lần',
   device: 'ứng dụng',
   web: 'trình duyệt',
   true: 'có',
@@ -81,7 +82,14 @@ function predicate(e: AuditEntry, userById: Map<string, User>): ReactNode {
   const verb = rest.join('.');
   switch (e.action) {
     case 'login':
+      if (target === 'link' || target === 'owner') return <>đã đăng nhập bằng <T>liên kết một lần</T> từ ứng dụng Compola</>;
       return <>đã đăng nhập{target && <> qua <T>{target}</T></>}</>;
+    case 'zalo.qr':
+      return <>đã lấy mã QR mới để đăng nhập Zalo cho máy chủ</>;
+    case 'zalo.logout':
+      return <>đã đăng xuất tài khoản Zalo{target && <> <T>{target}</T></>} khỏi máy chủ</>;
+    case 'zalo.retry':
+      return <>đã cho máy chủ thử chuẩn bị lại phần lõi Zalo</>;
     case 'login.failed':
       return <>đăng nhập thất bại{target && <> với <T>{target}</T></>}</>;
     case 'logout':
