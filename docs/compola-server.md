@@ -180,3 +180,36 @@ Refused with a message: `screen_capture_start`, `call_show_window`, `engine_show
 `engine_eval`, `automation_*` and `ai_clients_*` (except `automation_search`, `automation_search_status`,
 `automation_conversations`, `automation_messages`, which the host serves with the policy applied). Everything else →
 `remote_invoke`.
+
+## Activity tracking (per staff)
+
+Every call a server user makes through Compola Server (joined app, web client) is attributed and stored in
+`server.db` table `activity`, next to the audit log (the audit log is about administration; activity is about the
+Zalo work itself). Calls made directly in the host app are recorded with `user = null`, `device.kind = "host"`.
+
+Entry: `{id, at, account, user: {id, username, displayName} | null, device: {id, name, kind: "device" | "web" |
+"host"}, action, conversation: {id, name} | null, messageId, ok, responseMs | null, detail}`.
+`account` is the Zalo account id (`""` until multi-account lands).
+
+Actions (from `policy::describe_call`): `message.send` (text), `message.media`, `message.file`, `message.sticker`,
+`message.card`, `message.forward`, `message.recall`, `message.delete`, `message.react`, `message.pin`,
+`message.unpin`, `message.star`, `conversation.open`, `conversation.read`, `conversation.unread`,
+`conversation.pin`, `conversation.archive`, `conversation.mute`, `poll.create`, `poll.vote`, `reminder.create`,
+`group.member`, `contact.request`, … (`detail.call` keeps `target.method`). Message text is never stored.
+
+`responseMs`: on a successful send, the time since the oldest inbound message of that conversation that had no
+reply yet (from the host's renderer state), else null.
+
+- `GET /api/admin/activity?userId=&account=&conversationId=&action=<exact or prefix>&from=<ms>&to=<ms>&limit=100&before=<id>`
+  → `[entry]`, newest first.
+- `GET /api/admin/activity/stats?from=&to=&account=&userId=&groupBy=user|day|account|conversation` →
+  `{rows: [{key, label, sent, media, recalled, reactions, reads, opens, conversations, responses, avgResponseMs,
+  medianResponseMs, p90ResponseMs}], totals: {…same}}`; `day` keys are `YYYY-MM-DD` in the host's local time.
+- `GET /api/admin/activity/export.csv?…filters` → CSV (UTF-8 with BOM, for Excel), `Content-Disposition: attachment`.
+
+## Web client (`/web/`)
+
+The desktop UI also runs in the browser at `<server>/web/` (built with `npm run build:web` into
+`src-tauri/web-dist`). It signs in with the console's cookie session (`/admin/#/login?next=/web/`), talks to `GET /ws`
+with that cookie (Origin must be the server's own), loads media from `/media/load` and uploads through `/upload`
+(cookie + `X-Compola: 1`). Same policy as joined apps: a user needs an access grant.
