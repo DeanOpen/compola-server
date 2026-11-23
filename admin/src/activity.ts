@@ -15,14 +15,27 @@ export const ACTIVITY_CATEGORIES: { key: string; label: string; actions: string[
       'message.pin',
       'message.unpin',
       'message.star',
+      'message.action',
+      'message.confirm',
       'conversation.unread',
       'conversation.pin',
+      'conversation.unpin',
       'conversation.archive',
+      'conversation.unarchive',
       'conversation.mute',
+      'conversation.delete',
+      'conversation.hide',
+      'conversation.unhide',
+      'conversation.hiddenPin',
+      'conversation.label',
+      'label',
       'poll',
       'reminder',
       'group',
       'contact',
+      'settings',
+      'cloud',
+      'transfer',
     ],
   },
 ];
@@ -66,9 +79,49 @@ export const ACTIVITY_VERB: Record<string, string> = {
   'poll.create': 'đã tạo bình chọn',
   'poll.vote': 'đã bình chọn',
   'reminder.create': 'đã tạo nhắc hẹn',
+  'message.action': 'đã bấm nút trong tin nhắn',
+  'message.confirm': 'đã xác nhận tin nhắn',
+  'conversation.unpin': 'đã bỏ ghim hội thoại',
+  'conversation.unarchive': 'đã bỏ lưu trữ hội thoại',
+  'conversation.delete': 'đã xóa hội thoại',
+  'conversation.hide': 'đã ẩn hội thoại',
+  'conversation.unhide': 'đã bỏ ẩn hội thoại',
+  'conversation.hiddenPin': 'đã đổi mã PIN hội thoại ẩn',
+  'conversation.label': 'đã gắn / bỏ nhãn hội thoại',
+  'reminder.respond': 'đã trả lời nhắc hẹn',
   'group.member': 'đã thay đổi thành viên nhóm',
+  'group.create': 'đã tạo nhóm',
+  'group.join': 'đã tham gia nhóm',
+  'group.decline': 'đã từ chối lời mời vào nhóm',
   'contact.request': 'đã gửi lời mời kết bạn',
+  'contact.accept': 'đã đồng ý kết bạn',
+  'contact.decline': 'đã từ chối lời mời kết bạn',
+  'contact.cancel': 'đã hủy lời mời kết bạn',
+  'contact.dismiss': 'đã bỏ qua gợi ý kết bạn',
+  'contact.block': 'đã chặn / bỏ chặn liên hệ',
+  'contact.alias': 'đã đặt tên gợi nhớ cho liên hệ',
+  'settings.notification': 'đã đổi cài đặt thông báo',
+  'settings.sticker': 'đã đổi bộ sticker',
+  'cloud.delete': 'đã xóa dữ liệu trong Cloud của tôi',
+  'cloud.offload': 'đã dọn dữ liệu Cloud khỏi máy',
 };
+
+/** Prefix families without a specific verb above. */
+const FAMILY_VERB: Record<string, string> = {
+  label: 'đã sửa nhãn',
+  transfer: 'đã chuyển dữ liệu',
+  poll: 'đã thao tác bình chọn',
+  reminder: 'đã thao tác nhắc hẹn',
+  group: 'đã thao tác nhóm',
+  contact: 'đã thao tác liên hệ',
+  settings: 'đã đổi cài đặt',
+  cloud: 'đã thao tác Cloud của tôi',
+};
+
+/** The predicate for any action: the specific verb, else its family's, else the raw call. */
+export function activityVerb(action: string, call?: unknown): string {
+  return ACTIVITY_VERB[action] ?? FAMILY_VERB[action.split('.')[0]] ?? `đã thao tác ${String(call ?? action)}`;
+}
 
 /** "45 giây", "3 phút", "1 giờ 20 phút", "2 ngày 3 giờ". */
 export function formatDuration(ms: number | null | undefined): string {

@@ -235,6 +235,8 @@ export interface ActivityEntry {
   at: Timestamp;
   /** Zalo account id; "" until multi-account lands. */
   account: string;
+  /** The Zalo uid of that account, when known. */
+  accountUid?: string | null;
   /** null = done directly in the host app. */
   user: UserBrief | null;
   device: { id: string; name: string; kind: 'device' | 'web' | 'host' };

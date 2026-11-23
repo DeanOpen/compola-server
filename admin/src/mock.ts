@@ -264,7 +264,7 @@ const activity: ActivityEntry[] = (() => {
   const rnd = () => ((x = (x * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
   const pick = <T,>(a: T[]) => a[Math.floor(rnd() * a.length)];
   const deviceOf = (uid: string | null): ActivityEntry['device'] => {
-    if (!uid) return { id: '', name: 'Máy chủ', kind: 'host' };
+    if (!uid) return { id: '', name: 'MacBook Air của Bình', kind: 'host' };
     const s = sessions.filter((x) => x.user?.id === uid);
     const d = s.length ? s[Math.floor(rnd() * s.length)] : null;
     return d ? { id: d.deviceId, name: d.deviceName, kind: d.kind } : { id: '', name: 'Trình duyệt', kind: 'web' };
@@ -283,6 +283,9 @@ const activity: ActivityEntry[] = (() => {
     ['conversation.mute', 1],
     ['poll.vote', 1],
     ['contact.request', 1],
+    ['conversation.label', 1],
+    ['contact.accept', 1],
+    ['group.join', 0.5],
   ];
   const viewerMix: [string, number][] = [
     ['conversation.open', 55],

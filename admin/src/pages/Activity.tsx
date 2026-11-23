@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ChevronRight, Download, MessagesSquare, RefreshCw, X } from 'lucide-react';
 import { api, type ActivityQuery } from '../api';
-import { ACTIVITY_CATEGORIES, ACTIVITY_VERB, CATEGORY_TONE, categoryOf, formatDuration, frameRange, type Frame } from '../activity';
+import { ACTIVITY_CATEGORIES, activityVerb, CATEGORY_TONE, categoryOf, formatDuration, frameRange, type Frame } from '../activity';
 import { formatDateTime, formatRelative, personText, shortId } from '../format';
 import { useLoad } from '../hooks';
 import { navigate, useRoute } from '../router';
@@ -17,7 +17,7 @@ const PAGE = 100;
 
 /** The device part of a sentence: "MacBook Pro #D7F3A91C", "Chrome · macOS (trình duyệt)", "máy chủ". */
 export function ActivityDevice({ device }: { device: ActivityEntry['device'] }) {
-  if (device.kind === 'host') return <span>máy chủ</span>;
+  if (device.kind === 'host') return <span>máy chủ{device.name && device.name !== 'Máy chủ' ? ` (${device.name})` : ''}</span>;
   if (device.kind === 'web')
     return (
       <span>
@@ -33,7 +33,7 @@ export function ActivityDevice({ device }: { device: ActivityEntry['device'] }) 
 
 export function ActivitySentence({ e }: { e: ActivityEntry }) {
   const name = e.user ? (e.user.displayName && e.user.displayName !== e.user.username ? e.user.displayName : null) : null;
-  const base = ACTIVITY_VERB[e.action] ?? `đã thao tác ${String(e.detail?.call ?? e.action)}`;
+  const base = activityVerb(e.action, e.detail?.call);
   // A refused / failed call: "đã thử gửi tin nhắn … · không thành công".
   const verb = e.ok ? base : base.replace(/^đã /, 'đã thử ');
   // "đã mở hội thoại «X»" but "đã gửi tin nhắn trong «X»".
