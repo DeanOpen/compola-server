@@ -65,8 +65,8 @@ export function AuditPage() {
   return (
     <div className="page">
       <PageHeader
-        title="Nhật ký"
-        subtitle="Ai đã làm gì: đăng nhập, thay đổi cấu hình, thiết bị và thao tác trên tài khoản Zalo"
+        title="Nhật ký quản trị"
+        subtitle="Đăng nhập, thay đổi cấu hình, quyền và thiết bị trên máy chủ. Việc nhân viên làm trên Zalo xem ở Hoạt động."
         actions={
           <Button icon={<RefreshCw size={16} />} busy={first.loading} onClick={() => first.reload()}>
             Làm mới

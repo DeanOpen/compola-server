@@ -220,7 +220,7 @@ pub struct ActivityFilter {
     pub user_id: Option<String>,
     pub account: Option<String>,
     pub conversation_id: Option<String>,
-    /// Exact action or a prefix (`message` matches `message.send`).
+    /// Comma-separated actions, each exact or a prefix (`message` matches `message.send`).
     pub action: Option<String>,
     pub from: Option<i64>,
     pub to: Option<i64>,
@@ -230,7 +230,8 @@ pub struct ActivityFilter {
 
 const ACTIVITY_COLS: &str = "id, at, account, user_id, username, display_name, device_id, device_name, device_kind, action, conversation_id, conversation_name, message_id, ok, response_ms, detail, account_uid";
 const ACTIVITY_WHERE: &str = "(?1 IS NULL OR user_id = ?1) AND (?2 IS NULL OR account = ?2) AND (?3 IS NULL OR conversation_id = ?3)
-  AND (?4 IS NULL OR action = ?4 OR action LIKE ?4 || '.%') AND (?5 IS NULL OR at >= ?5) AND (?6 IS NULL OR at < ?6)";
+  AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(?4) j WHERE activity.action = j.value OR activity.action LIKE j.value || '.%'))
+  AND (?5 IS NULL OR at >= ?5) AND (?6 IS NULL OR at < ?6)";
 
 fn activity_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let user_id: Option<String> = r.get(3)?;
@@ -435,6 +436,14 @@ fn clean_scope(scope: Scope) -> Scope {
         Scope { all: true, conversations: Vec::new(), labels: Vec::new() }
     } else {
         Scope { all: false, conversations: dedupe(scope.conversations), labels: dedupe(scope.labels) }
+    }
+}
+
+impl ActivityFilter {
+    /// The action list as the JSON array the queries read (`json_each`).
+    fn actions(&self) -> Option<String> {
+        let list: Vec<&str> = self.action.as_deref()?.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+        (!list.is_empty()).then(|| serde_json::to_string(&list).unwrap_or_default())
     }
 }
 
@@ -999,7 +1008,7 @@ impl Store {
         ))?;
         let rows = st
             .query_map(
-                params![f.user_id, f.account, f.conversation_id, f.action, f.from, f.to, f.before, f.limit.unwrap_or(100).clamp(1, 1000)],
+                params![f.user_id, f.account, f.conversation_id, f.actions(), f.from, f.to, f.before, f.limit.unwrap_or(100).clamp(1, 1000)],
                 activity_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1015,7 +1024,7 @@ impl Store {
         ))?;
         let mut groups: std::collections::BTreeMap<String, Tally> = std::collections::BTreeMap::new();
         let mut totals = Tally::default();
-        let mut rows = st.query(params![f.user_id, f.account, f.conversation_id, f.action, f.from, f.to])?;
+        let mut rows = st.query(params![f.user_id, f.account, f.conversation_id, f.actions(), f.from, f.to])?;
         while let Some(r) = rows.next()? {
             let at: i64 = r.get(0)?;
             let account: String = r.get(1)?;
@@ -1054,7 +1063,7 @@ impl Store {
         let c = self.conn.lock();
         let mut st = c.prepare(&format!("SELECT {ACTIVITY_COLS} FROM activity WHERE {ACTIVITY_WHERE} ORDER BY id LIMIT 1000000"))?;
         let mut out = String::from("\u{feff}thoi_gian,tai_khoan_zalo,nguoi_dung,ten_hien_thi,thiet_bi,ma_thiet_bi,loai_thiet_bi,hanh_dong,hoi_thoai,ten_hoi_thoai,tin_nhan,thanh_cong,phan_hoi_ms\n");
-        let mut rows = st.query(params![f.user_id, f.account, f.conversation_id, f.action, f.from, f.to])?;
+        let mut rows = st.query(params![f.user_id, f.account, f.conversation_id, f.actions(), f.from, f.to])?;
         while let Some(r) = rows.next()? {
             use chrono::TimeZone;
             let at: i64 = r.get(1)?;
@@ -1172,6 +1181,8 @@ mod tests {
         assert_eq!(s.activity(&lan).unwrap().len(), 3);
         let messages = ActivityFilter { action: Some("message".into()), ..Default::default() };
         assert_eq!(s.activity(&messages).unwrap().len(), 4);
+        let two = ActivityFilter { action: Some("message.react, conversation.open".into()), ..Default::default() };
+        assert_eq!(s.activity(&two).unwrap().len(), 2);
         let stats = s.activity_stats(&all, "user").unwrap();
         assert_eq!(stats["totals"]["sent"], json!(3));
         assert_eq!(stats["totals"]["conversations"], json!(2));

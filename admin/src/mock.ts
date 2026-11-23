@@ -1,7 +1,7 @@
 // In-memory Compola Server for `npm run dev:admin` with `?mock=1`: every endpoint of docs/compola-server.md, enough
 // to click through all screens. Loaded with a dynamic import only in mock mode; not part of a production build.
 import { effective } from './access';
-import type { AuditEntry, Conversation, Grant, Group, Label, Provider, ServerInfo, Session, User, ZaloPhase } from './types';
+import type { ActivityEntry, ActivityStatsRow, AuditEntry, Conversation, Grant, Group, Label, Provider, ServerInfo, Session, User, ZaloPhase } from './types';
 
 type Res = { status: number; body: unknown };
 
@@ -9,6 +9,7 @@ const now = Date.now();
 const min = 60_000;
 const hour = 60 * min;
 const day = 24 * hour;
+const day0 = day;
 let seq = 1000;
 const nid = (p: string) => `${p}_${(++seq).toString(36)}`;
 
@@ -254,6 +255,198 @@ function zaloStatus() {
   const account = { name: phase.kind === 'ready' ? 'Shop Compola' : '', avatar: '', phase: phase.kind };
   server.account = account;
   return { phase, account };
+}
+
+// ---- Staff activity: 30 days of work by lan, minh, vy (agents), hoa (viewer) and the host ----
+
+const activity: ActivityEntry[] = (() => {
+  let x = 42;
+  const rnd = () => ((x = (x * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const pick = <T,>(a: T[]) => a[Math.floor(rnd() * a.length)];
+  const deviceOf = (uid: string | null): ActivityEntry['device'] => {
+    if (!uid) return { id: '', name: 'Máy chủ', kind: 'host' };
+    const s = sessions.filter((x) => x.user?.id === uid);
+    const d = s.length ? s[Math.floor(rnd() * s.length)] : null;
+    return d ? { id: d.deviceId, name: d.deviceName, kind: d.kind } : { id: '', name: 'Trình duyệt', kind: 'web' };
+  };
+  const agentMix: [string, number][] = [
+    ['message.send', 40],
+    ['message.media', 7],
+    ['message.file', 3],
+    ['message.sticker', 3],
+    ['message.forward', 1],
+    ['message.react', 10],
+    ['conversation.open', 16],
+    ['conversation.read', 14],
+    ['message.recall', 2],
+    ['message.pin', 1],
+    ['conversation.mute', 1],
+    ['poll.vote', 1],
+    ['contact.request', 1],
+  ];
+  const viewerMix: [string, number][] = [
+    ['conversation.open', 55],
+    ['conversation.read', 40],
+    ['message.send', 5], // refused: viewers cannot send
+  ];
+  const draw = (mix: [string, number][]) => {
+    let r = rnd() * mix.reduce((n, [, w]) => n + w, 0);
+    for (const [a, w] of mix) if ((r -= w) <= 0) return a;
+    return mix[0][0];
+  };
+  const people: { id: string | null; perDay: number; mix: [string, number][]; speed: number }[] = [
+    { id: 'u_lan', perDay: 34, mix: agentMix, speed: 3 * 60_000 },
+    { id: 'u_minh', perDay: 22, mix: agentMix, speed: 9 * 60_000 },
+    { id: 'u_vy', perDay: 18, mix: agentMix, speed: 5 * 60_000 },
+    { id: 'u_hoa', perDay: 6, mix: viewerMix, speed: 0 },
+    { id: null, perDay: 4, mix: agentMix, speed: 20 * 60_000 },
+  ];
+  const out: ActivityEntry[] = [];
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  for (let day = 29; day >= 0; day--) {
+    const base = start.getTime() - day * day0;
+    const weekend = [0, 6].includes(new Date(base).getDay());
+    for (const p of people) {
+      const n = Math.round(p.perDay * (weekend ? 0.3 : 1) * (0.6 + rnd() * 0.8));
+      for (let i = 0; i < n; i++) {
+        const at = base + (8 + rnd() * 12) * 3_600_000;
+        if (at > now) continue;
+        const action = draw(p.mix);
+        const conv = pick(conversations);
+        const user = p.id ? users.find((u) => u.id === p.id) ?? null : null;
+        const refused = p.id === 'u_hoa' && action === 'message.send';
+        const ok = !refused && rnd() > 0.02;
+        const isSend = ['message.send', 'message.media', 'message.file', 'message.sticker'].includes(action);
+        const responseMs = ok && isSend && rnd() < 0.6 ? Math.round(p.speed * (0.15 + rnd() * rnd() * 4)) : null;
+        out.push({
+          id: 0,
+          at: Math.round(at),
+          account: '',
+          user: user ? { id: user.id, username: user.username, displayName: user.displayName } : null,
+          device: deviceOf(p.id),
+          action,
+          conversation: action === 'contact.request' ? null : { id: conv.id, name: conv.name },
+          messageId: action.startsWith('message.') ? `m${Math.floor(rnd() * 1e9)}` : null,
+          ok,
+          responseMs,
+          detail: { call: action.replace('.', '_'), ...(refused ? { error: 'Vai trò người xem không được gửi tin.' } : !ok ? { error: 'Zalo từ chối: thử lại sau.' } : {}) },
+        });
+      }
+    }
+  }
+  out.sort((a, b) => Number(b.at) - Number(a.at));
+  out.forEach((e, i) => (e.id = 100_000 - i));
+  return out;
+})();
+
+function activityFilter(q: URLSearchParams): (e: ActivityEntry) => boolean {
+  const userId = q.get('userId');
+  const account = q.get('account');
+  const conv = q.get('conversationId');
+  const actions = (q.get('action') ?? '').split(',').filter(Boolean);
+  const from = Number(q.get('from') ?? '') || null;
+  const to = Number(q.get('to') ?? '') || null;
+  return (e) =>
+    (!userId || (userId === 'host' ? !e.user : e.user?.id === userId)) &&
+    (account === null || account === '' || e.account === account) &&
+    (!conv || e.conversation?.id === conv) &&
+    (!actions.length || actions.some((a) => e.action === a || e.action.startsWith(a + '.'))) &&
+    (!from || Number(e.at) >= from) &&
+    (!to || Number(e.at) < to);
+}
+
+/** Same tally as store.rs `Tally`. */
+function tally(entries: ActivityEntry[], key: string, label: string): ActivityStatsRow {
+  const r: ActivityStatsRow = { key, label, sent: 0, media: 0, recalled: 0, reactions: 0, reads: 0, opens: 0, conversations: 0, responses: 0, avgResponseMs: null, medianResponseMs: null, p90ResponseMs: null };
+  const convs = new Set<string>();
+  const times: number[] = [];
+  for (const e of entries) {
+    if (['message.send', 'message.sticker', 'message.card', 'message.forward'].includes(e.action)) r.sent++;
+    if (e.action === 'message.media' || e.action === 'message.file') {
+      r.sent++;
+      r.media++;
+    }
+    if (e.action === 'message.recall') r.recalled++;
+    if (e.action === 'message.react') r.reactions++;
+    if (e.action === 'conversation.read') r.reads++;
+    if (e.action === 'conversation.open') r.opens++;
+    if (e.action.startsWith('message.') && e.conversation) convs.add(e.conversation.id);
+    if (e.responseMs !== null) times.push(e.responseMs);
+  }
+  times.sort((a, b) => a - b);
+  const n = times.length;
+  r.conversations = convs.size;
+  r.responses = n;
+  if (n) {
+    r.avgResponseMs = Math.round(times.reduce((a, b) => a + b, 0) / n);
+    r.medianResponseMs = times[Math.round((n - 1) * 0.5)];
+    r.p90ResponseMs = times[Math.round((n - 1) * 0.9)];
+  }
+  return r;
+}
+
+function activityStats(q: URLSearchParams) {
+  const rows = activity.filter(activityFilter(q)).filter((e) => e.ok);
+  const by = q.get('groupBy') ?? 'user';
+  const groups = new Map<string, { label: string; entries: ActivityEntry[] }>();
+  for (const e of rows) {
+    let key: string;
+    let label: string;
+    if (by === 'day') {
+      const d = new Date(Number(e.at));
+      key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      label = key;
+    } else if (by === 'account') {
+      key = e.account;
+      label = e.account;
+    } else if (by === 'conversation') {
+      if (!e.conversation) continue;
+      key = e.conversation.id;
+      label = e.conversation.name;
+    } else {
+      key = e.user?.id ?? 'host';
+      label = e.user ? e.user.displayName || e.user.username : 'Máy chủ';
+    }
+    const g = groups.get(key) ?? { label, entries: [] };
+    g.entries.push(e);
+    groups.set(key, g);
+  }
+  return {
+    rows: [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, g]) => tally(g.entries, k, g.label)),
+    totals: tally(rows, 'total', 'total'),
+  };
+}
+
+function activityCsv(q: URLSearchParams): string {
+  const esc = (v: unknown) => {
+    const s = v === null || v === undefined ? '' : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const head = ['thời gian', 'tài khoản Zalo', 'người dùng', 'tên', 'thiết bị', 'mã thiết bị', 'loại thiết bị', 'thao tác', 'hội thoại', 'mã hội thoại', 'thành công', 'phản hồi (giây)'];
+  const lines = activity
+    .filter(activityFilter(q))
+    .slice()
+    .reverse()
+    .map((e) =>
+      [
+        new Date(Number(e.at)).toISOString(),
+        e.account,
+        e.user?.username ?? '',
+        e.user?.displayName ?? 'Máy chủ',
+        e.device.name,
+        e.device.id,
+        e.device.kind,
+        e.action,
+        e.conversation?.name ?? '',
+        e.conversation?.id ?? '',
+        e.ok ? 'có' : 'không',
+        e.responseMs === null ? '' : Math.round(e.responseMs / 1000),
+      ]
+        .map(esc)
+        .join(','),
+    );
+  return '\ufeff' + [head.join(','), ...lines].join('\r\n');
 }
 
 const STORAGE_KEY = 'compola-admin-mock-user';
@@ -541,6 +734,16 @@ export async function handle(method: string, rawPath: string, body: unknown): Pr
       const action = q.get('action');
       const rows = audit.filter((e) => (!before || Number(e.id) < Number(before)) && (!userId || e.actor?.userId === userId) && (!action || e.action === action));
       return ok(rows.slice(0, limit));
+    }
+    case 'activity': {
+      if (method !== 'GET') break;
+      if (id === 'stats') return ok(activityStats(q));
+      if (id === 'export.csv') return ok(activityCsv(q));
+      if (id) break;
+      const limit = Number(q.get('limit') ?? 100);
+      const before = q.get('before');
+      const f = activityFilter(q);
+      return ok(activity.filter((e) => (!before || Number(e.id) < Number(before)) && f(e)).slice(0, limit));
     }
     case 'zalo': {
       if (method === 'GET') return ok(zaloStatus());

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { ArrowDown, ArrowUp, ArrowUpDown, KeyRound, Lock, LockOpen, MonitorSmartphone, Pencil, ShieldCheck, Trash2, UserPlus } from 'lucide-react';
+import { Activity as ActivityIcon, ArrowDown, ArrowUp, ArrowUpDown, KeyRound, Lock, LockOpen, MonitorSmartphone, Pencil, ShieldCheck, Trash2, UserPlus } from 'lucide-react';
 import { api, ApiError, type UserInput } from '../api';
 import { effective } from '../access';
 import { formatDateTime, formatRelative, isLocal, personText, sourceInfo, toDate } from '../format';
@@ -187,6 +187,7 @@ export function UsersTab({
                               { label: 'Sửa thông tin', icon: <Pencil size={15} />, onSelect: () => setModal({ kind: 'edit', user: u }) },
                               isLocal(u.source) && { label: 'Đặt lại mật khẩu', icon: <KeyRound size={15} />, onSelect: () => setModal({ kind: 'password', user: u }) },
                               { label: 'Xem quyền truy cập', icon: <ShieldCheck size={15} />, onSelect: () => navigate(`/grants?user=${encodeURIComponent(u.id)}`) },
+                              { label: 'Xem hoạt động', icon: <ActivityIcon size={15} />, onSelect: () => navigate(`/activity?userId=${encodeURIComponent(u.id)}`) },
                               { label: 'Xem thiết bị', icon: <MonitorSmartphone size={15} />, onSelect: () => navigate(`/sessions?q=${encodeURIComponent(u.username)}`) },
                               !self &&
                                 (u.disabled

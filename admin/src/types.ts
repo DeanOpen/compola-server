@@ -227,3 +227,44 @@ export interface ZaloStatus {
   phase: ZaloPhase | null;
   account: { name: string; avatar: string; phase: string } | null;
 }
+
+// ---- Activity tracking (per staff): docs/compola-server.md "Activity tracking" ----
+
+export interface ActivityEntry {
+  id: number | string;
+  at: Timestamp;
+  /** Zalo account id; "" until multi-account lands. */
+  account: string;
+  /** null = done directly in the host app. */
+  user: UserBrief | null;
+  device: { id: string; name: string; kind: 'device' | 'web' | 'host' };
+  action: string;
+  conversation: { id: string; name: string } | null;
+  messageId: string | null;
+  ok: boolean;
+  responseMs: number | null;
+  detail: Record<string, unknown> | null;
+}
+
+export interface ActivityStatsRow {
+  key: string;
+  label: string;
+  sent: number;
+  media: number;
+  recalled: number;
+  reactions: number;
+  reads: number;
+  opens: number;
+  conversations: number;
+  responses: number;
+  avgResponseMs: number | null;
+  medianResponseMs: number | null;
+  p90ResponseMs: number | null;
+}
+
+export interface ActivityStats {
+  rows: ActivityStatsRow[];
+  totals: Omit<ActivityStatsRow, 'key' | 'label'> & Partial<Pick<ActivityStatsRow, 'key' | 'label'>>;
+}
+
+export type ActivityGroupBy = 'user' | 'day' | 'account' | 'conversation';

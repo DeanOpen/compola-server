@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import {
+  Activity,
+  BarChart3,
   CircleUser,
   KeyRound,
   LayoutDashboard,
@@ -31,6 +33,8 @@ import { SessionsPage } from './pages/Sessions';
 import { AuditPage } from './pages/Audit';
 import { SettingsPage } from './pages/Settings';
 import { ZaloPage } from './pages/Zalo';
+import { ActivityPage } from './pages/Activity';
+import { StatsPage } from './pages/Stats';
 
 interface NavItem {
   path: string;
@@ -53,10 +57,17 @@ const NAV_SECTIONS: { label: string | null; items: NavItem[] }[] = [
     ],
   },
   {
-    label: 'Bảo mật & giám sát',
+    label: 'Giám sát',
+    items: [
+      { path: '/activity', label: 'Hoạt động', icon: <Activity size={18} />, render: () => <ActivityPage /> },
+      { path: '/stats', label: 'Thống kê', icon: <BarChart3 size={18} />, render: () => <StatsPage /> },
+    ],
+  },
+  {
+    label: 'Bảo mật',
     items: [
       { path: '/sessions', label: 'Thiết bị', icon: <MonitorSmartphone size={18} />, render: () => <SessionsPage /> },
-      { path: '/audit', label: 'Nhật ký', icon: <ScrollText size={18} />, render: () => <AuditPage /> },
+      { path: '/audit', label: 'Nhật ký quản trị', icon: <ScrollText size={18} />, render: () => <AuditPage /> },
     ],
   },
   {

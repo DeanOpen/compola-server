@@ -18,6 +18,9 @@ import type {
   Session,
   User,
   ZaloStatus,
+  ActivityEntry,
+  ActivityGroupBy,
+  ActivityStats,
 } from './types';
 
 export class ApiError extends Error {
@@ -141,6 +144,23 @@ function one<T>(value: unknown, key: string): T {
 
 const enc = encodeURIComponent;
 
+/** Filters shared by the activity endpoints (empty values are left out). `action` is exact or a prefix; several
+ *  values are comma-separated (one category covers several actions). */
+export type ActivityQuery = {
+  userId?: string;
+  account?: string;
+  conversationId?: string;
+  action?: string;
+  from?: number;
+  to?: number;
+};
+
+function activityParams(q: Record<string, string | number | undefined | null>): string {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== null && v !== '') p.set(k, String(v));
+  return p.toString();
+}
+
 export interface UserInput {
   username: string;
   displayName: string;
@@ -235,6 +255,32 @@ export const api = {
     if (q.userId) p.set('userId', q.userId);
     if (q.action) p.set('action', q.action);
     return request<unknown>('GET', `/api/admin/audit?${p}`).then((r) => list<AuditEntry>(r, 'entries', 'audit'));
+  },
+
+  // Activity tracking
+  activity: (q: ActivityQuery & { limit?: number; before?: string | number }) =>
+    request<unknown>('GET', `/api/admin/activity?${activityParams({ ...q, limit: q.limit ?? 100 })}`).then((r) => list<ActivityEntry>(r, 'entries')),
+  activityStats: (q: ActivityQuery & { groupBy: ActivityGroupBy }) =>
+    request<ActivityStats>('GET', `/api/admin/activity/stats?${activityParams(q)}`),
+  /** Downloads `/api/admin/activity/export.csv?<filters>` (a plain link: the cookie authenticates it). */
+  async exportActivityCsv(q: ActivityQuery & { groupBy?: ActivityGroupBy }) {
+    const path = `/api/admin/activity/export.csv?${activityParams(q)}`;
+    if (!isMock) {
+      const a = document.createElement('a');
+      a.href = path;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return;
+    }
+    const csv = await request<string>('GET', path);
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'compola-activity.csv';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   },
 
   // The host's Zalo account
