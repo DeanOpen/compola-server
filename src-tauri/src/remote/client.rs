@@ -146,7 +146,7 @@ pub struct DeviceStart {
     pub user_code: String,
     pub verify_url: String,
     interval: u64,
-    expires_in: u64,
+    pub expires_in: u64,
 }
 
 pub async fn device_start(base: &url::Url, device_name: &str, device_id: &str) -> Result<DeviceStart, String> {

@@ -587,7 +587,8 @@ pub async fn remote_admin_open(remote: RemoteState<'_>) -> Result<String, String
 
 /// Revokes a joined session (the person signs in again to come back).
 #[tauri::command]
-pub fn remote_kick(remote: RemoteState<'_>, id: String) -> Result<bool, String> {
+pub fn remote_kick(remote: RemoteState<'_>, session_id: String) -> Result<bool, String> {
+    let id = session_id;
     let auth = remote.auth().ok_or("Không mở được cơ sở dữ liệu tài khoản.")?;
     let session = auth.store.delete_session(&id).map_err(|e| e.message)?;
     if let Some(s) = &session {
@@ -646,15 +647,28 @@ pub async fn remote_join_password(
 
 /// Sign-in through the browser (any provider, SSO included): device flow, then saves and restarts joined.
 #[tauri::command]
-pub async fn remote_join_browser(app: AppHandle, remote: RemoteState<'_>, url: String, device_name: String) -> Result<(), String> {
+pub async fn remote_join_browser(
+    app: AppHandle,
+    remote: RemoteState<'_>,
+    url: String,
+    device_name: String,
+    provider: Option<String>,
+) -> Result<(), String> {
     if remote.is_joined() {
         return Err("Máy này đang tham gia một Compola Server khác.".into());
     }
     let base = client::normalize_url(&url)?;
     let device_name = device_name_or_default(&device_name);
     let instance = remote.config.lock().instance.clone();
-    let start = client::device_start(&base, &device_name, &instance).await?;
-    let _ = app.emit_to("main", EVENT, json!({ "kind": "joinProgress", "userCode": start.user_code, "verifyUrl": start.verify_url }));
+    let mut start = client::device_start(&base, &device_name, &instance).await?;
+    // An SSO button: straight to that provider, which comes back to the approval page.
+    if let Some(p) = provider.filter(|p| !p.is_empty() && p != "local") {
+        let next: String = url::form_urlencoded::byte_serialize(format!("/admin/#/device?code={}", start.user_code).as_bytes()).collect();
+        let pid: String = url::form_urlencoded::byte_serialize(p.as_bytes()).collect();
+        let code: String = url::form_urlencoded::byte_serialize(start.user_code.as_bytes()).collect();
+        start.verify_url = format!("{}api/auth/oidc/{pid}/start?next={next}&device={code}", base);
+    }
+    let _ = app.emit_to("main", EVENT, json!({ "kind": "joinProgress", "userCode": start.user_code, "verifyUrl": start.verify_url, "expiresIn": start.expires_in }));
     tauri_plugin_opener::open_url(&start.verify_url, None::<&str>).map_err(|e| e.to_string())?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     *remote.join_cancel.lock() = Some(tx);

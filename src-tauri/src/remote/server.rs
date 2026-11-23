@@ -62,6 +62,7 @@ struct Peer {
     session_id: String,
     user_id: String,
     username: String,
+    display_name: String,
     device_id: String,
     device_name: String,
     addr: String,
@@ -95,7 +96,9 @@ impl Hub {
             .iter()
             .map(|p| {
                 json!({
-                    "id": p.session_id, "userId": p.user_id, "username": p.username, "deviceId": p.device_id,
+                    "id": p.session_id, "userId": p.user_id, "username": p.username,
+                    "user": { "id": p.user_id, "username": p.username, "displayName": p.display_name },
+                    "kind": "device", "online": true, "ip": p.addr, "deviceId": p.device_id,
                     "deviceName": p.device_name, "address": p.addr, "since": p.since, "role": p.access.lock().role,
                 })
             })
@@ -438,6 +441,7 @@ async fn session_loop(remote: Arc<Remote>, ws: WebSocketStream<TcpStream>, ip: S
         session_id: session.id.clone(),
         user_id: user.id.clone(),
         username: user.username.clone(),
+        display_name: user.display_name.clone(),
         device_id: session.device_id.clone(),
         device_name: session.device_name.clone(),
         addr: ip.clone(),

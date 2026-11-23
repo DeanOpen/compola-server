@@ -759,6 +759,25 @@ fn check_adapter(access: &Access, mirror: &Mirror, target: &str, method: &str, a
 
 /// Classify + authorize one invoke of a joined user. `cmd` is the WebSocket invoke command; `args` its args object
 /// (for `engine_call`: `{target, method, args:[…]}`). Err(message in Vietnamese) when refused.
+/// Settings of the shared account that change it for everyone (the host's own notifications, the hidden-chat PIN,
+/// and Zalo labels, which also define label scopes): admins only.
+const HOST_SETTINGS: &[(&str, &str)] = &[
+    ("__zaloNotification", "setEnabled"),
+    ("__zaloNotification", "setSound"),
+    ("__zaloSticker", "setSuggestSetting"),
+    ("__zaloConvActions", "setPin"),
+    ("__zaloConvActions", "resetPin"),
+    ("__zaloConvActions", "hide"),
+    ("__zaloConvActions", "hideWithNewPin"),
+    ("__zaloConvActions", "unhide"),
+    ("__zaloConversations", "setConvLabel"),
+    ("__zaloConversations", "createLabel"),
+    ("__zaloConversations", "updateLabel"),
+    ("__zaloConversations", "deleteLabel"),
+    ("__zaloConversations", "reorderLabels"),
+];
+const DENIED_HOST_SETTINGS: &str = "Chỉ quản trị viên Compola Server mới đổi được cài đặt chung của tài khoản này.";
+
 pub fn check_call(access: &Access, mirror: &Mirror, cmd: &str, args: &Value) -> Result<CallKind, String> {
     let scoped_conversation = |key: &str| -> Result<CallKind, String> {
         match args.get(key) {
@@ -770,18 +789,21 @@ pub fn check_call(access: &Access, mirror: &Mirror, cmd: &str, args: &Value) -> 
     };
     match cmd {
         "engine_call" | "engine_call_with_files" => {
+            let (target, method) = (str_of(args.get("target")), str_of(args.get("method")));
+            if !access.is_admin() && HOST_SETTINGS.contains(&(target, method)) {
+                return Err(DENIED_HOST_SETTINGS.into());
+            }
             let list = args.get("args").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
             check_adapter(access, mirror, str_of(args.get("target")), str_of(args.get("method")), list)
         }
         "engine_phase" | "engine_info" | "engine_replay" => Ok(CallKind::Read),
         // The host's own sign-in / runtime: agents with every conversation (and admins).
+        // Signing the host in to Zalo (its QR is only shown to admins) and repairing its runtime: admins only.
         "engine_refresh_qr" | "engine_retry_runtime" => {
-            if !access.can_write() {
-                Err(DENIED_VIEWER.into())
-            } else if !access.sees_all() {
-                Err(DENIED_ACCOUNT_WIDE.into())
-            } else {
+            if access.is_admin() {
                 Ok(CallKind::Write)
+            } else {
+                Err(DENIED_HOST_SETTINGS.into())
             }
         }
         // Results filtered by `filter_result`.
@@ -1324,6 +1346,17 @@ mod tests {
     }
 
     #[test]
+    fn shared_settings_are_for_admins_only() {
+        let agent = Access { role: Role::Agent, scope: Scope { all: true, ..Default::default() } };
+        let admin = Access { role: Role::Admin, scope: Scope { all: true, ..Default::default() } };
+        let m = Mirror::default();
+        let call = |t: &str, me: &str| json!({ "target": t, "method": me, "args": [false] });
+        assert!(check_call(&agent, &m, "engine_call", &call("__zaloNotification", "setEnabled")).is_err());
+        assert!(check_call(&agent, &m, "engine_call", &call("__zaloConversations", "createLabel")).is_err());
+        assert!(check_call(&admin, &m, "engine_call", &call("__zaloNotification", "setEnabled")).is_ok());
+    }
+
+    #[test]
     fn account_wide_features_need_all_scope() {
         let m = mirror();
         let a = scoped_agent();
@@ -1335,19 +1368,15 @@ mod tests {
             ("__zaloGroupCreate", "info", json!([])),
             ("__zaloChat", "groupJoin", json!(["https://zalo.me/g/abc"])),
             ("__zaloChat", "prepareFriendRequest", json!([AN, AN, "add"])),
-            ("__zaloConversations", "createLabel", json!(["Mới", "#D91B1B", []])),
-            ("__zaloConversations", "setConvLabel", json!([AN, LABEL_VIP])),
             ("__zaloConvActions", "hiddenSearch", json!(["1234"])),
-            ("__zaloConvActions", "hide", json!([AN, "1234"])),
             ("__zaloCloud", "list", json!([{ "convId": AN, "kind": "media" }])),
             ("__zaloTransfer", "start", json!([])),
-            ("__zaloSticker", "setSuggestSetting", json!([false])),
         ] {
             assert_eq!(check(&a, &m, t, method, args.clone()), Err(DENIED_ACCOUNT_WIDE.into()), "{t}.{method}");
             assert!(check(&all_agent(), &m, t, method, args).is_ok(), "{t}.{method} for an all-scope agent");
         }
         assert!(check_call(&a, &m, "engine_refresh_qr", &json!({})).is_err());
-        assert!(check_call(&all_agent(), &m, "engine_refresh_qr", &json!({})).is_ok());
+        assert!(check_call(&all_agent(), &m, "engine_refresh_qr", &json!({})).is_err());
         // Contacts list itself: allowed, the snapshot is filtered.
         assert_eq!(check(&a, &m, "__zaloContacts", "refresh", json!([])), Ok(CallKind::Read));
     }

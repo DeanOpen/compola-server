@@ -102,6 +102,11 @@ impl Ctx<'_> {
         format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}", if self.secure() { "; Secure" } else { "" })
     }
 
+    /// A web session's label: "Chrome · macOS" from the User-Agent (the console's sessions have no device id).
+    fn browser(&self) -> String {
+        browser_label(self.head.header("user-agent").unwrap_or_default())
+    }
+
     fn current(&self) -> R<(Session, User)> {
         let token = request_token(self.head).ok_or_else(|| StoreError::new(401, "Chưa đăng nhập."))?;
         let slide = (self.head.bearer().is_some()).then_some(auth::DEVICE_TTL_MS);
@@ -119,6 +124,36 @@ impl Ctx<'_> {
     fn audit(&self, actor: &User, action: &str, target: &str, detail: Value) {
         self.auth.store.audit(Some(actor), action, target, detail, &self.ip);
     }
+}
+
+pub fn browser_label(ua: &str) -> String {
+    let browser = if ua.contains("Edg/") {
+        "Edge"
+    } else if ua.contains("OPR/") || ua.contains("Opera") {
+        "Opera"
+    } else if ua.contains("Firefox/") {
+        "Firefox"
+    } else if ua.contains("Chrome/") || ua.contains("CriOS/") {
+        "Chrome"
+    } else if ua.contains("Safari/") {
+        "Safari"
+    } else {
+        "Trình duyệt"
+    };
+    let os = if ua.contains("iPhone") || ua.contains("iPad") {
+        "iOS"
+    } else if ua.contains("Android") {
+        "Android"
+    } else if ua.contains("Mac OS X") || ua.contains("Macintosh") {
+        "macOS"
+    } else if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Linux") {
+        "Linux"
+    } else {
+        ""
+    };
+    if os.is_empty() { browser.to_owned() } else { format!("{browser} · {os}") }
 }
 
 /// `next` must stay inside the admin console (no open redirect).
@@ -167,7 +202,7 @@ async fn route(ctx: &Ctx<'_>, method: &str, seg: &[&str]) -> R<Reply> {
         ("GET", ["auth", "otp"]) => {
             let user_id = ctx.head.param("t").and_then(|t| ctx.auth.otp_take(&t)).ok_or_else(|| StoreError::new(401, "Liên kết đã hết hạn. Mở lại từ Compola."))?;
             let user = ctx.auth.store.user(&user_id)?;
-            let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", "Trình duyệt", &ctx.ip, auth::WEB_TTL_MS)?;
+            let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", &ctx.browser(), &ctx.ip, auth::WEB_TTL_MS)?;
             ctx.audit(&user, "login", "owner", json!({ "method": "owner-link" }));
             Ok(Reply::redirect("/admin/").with_header("Set-Cookie", ctx.session_cookie(&token)))
         }
@@ -186,6 +221,37 @@ async fn route(ctx: &Ctx<'_>, method: &str, seg: &[&str]) -> R<Reply> {
             let (session, user) = ctx.current()?;
             let (access, via) = ctx.auth.store.access_of(&user)?;
             Ok(Reply::ok(json!({ "user": user, "session": session, "access": access, "via": via })))
+        }
+
+        ("GET", ["me", "sessions"]) => {
+            let (current, user) = ctx.current()?;
+            let list: Vec<Value> = ctx
+                .auth
+                .store
+                .sessions()?
+                .into_iter()
+                .filter(|s| s.user_id == user.id)
+                .map(|s| {
+                    json!({
+                        "id": s.id, "user": user.brief(), "kind": s.kind, "deviceId": s.device_id, "deviceName": s.device_name, "ip": s.ip,
+                        "createdAt": s.created_at, "lastSeenAt": s.last_seen_at, "expiresAt": s.expires_at,
+                        "online": ctx.remote.online_sessions().contains(&s.id), "current": s.id == current.id,
+                    })
+                })
+                .collect();
+            Ok(Reply::ok(json!(list)))
+        }
+        ("DELETE", ["me", "sessions", id]) => {
+            let (_, user) = ctx.current()?;
+            let mine = ctx.auth.store.sessions()?.into_iter().any(|s| s.id == *id && s.user_id == user.id);
+            if !mine {
+                return Err(StoreError::new(404, "Không tìm thấy phiên đăng nhập."));
+            }
+            if let Some(s) = ctx.auth.store.delete_session(id)? {
+                ctx.remote.session_revoked(&s.id);
+                ctx.audit(&user, "session.revoke", &s.device_name, json!({ "deviceId": s.device_id, "kind": s.kind, "own": true }));
+            }
+            Ok(Reply::ok(json!({ "ok": true })))
         }
 
         // ---- device flow ----
@@ -270,7 +336,7 @@ async fn login(ctx: &Ctx<'_>) -> R<Reply> {
             Ok(Reply::ok(json!({ "token": token, "user": user.brief() })))
         }
         None => {
-            let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", "Trình duyệt", &ctx.ip, auth::WEB_TTL_MS)?;
+            let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", &ctx.browser(), &ctx.ip, auth::WEB_TTL_MS)?;
             Ok(Reply::ok(json!({ "user": user })).with_header("Set-Cookie", ctx.session_cookie(&token)))
         }
     }
@@ -284,7 +350,7 @@ async fn oidc_callback(ctx: &Ctx<'_>) -> R<Reply> {
     let code = ctx.head.param("code").unwrap_or_default();
     let state = ctx.head.param("state").unwrap_or_default();
     let (user, next, device) = ctx.auth.oidc_callback(&code, &state, &ctx.ip).await?;
-    let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", "Trình duyệt", &ctx.ip, auth::WEB_TTL_MS)?;
+    let (_, token) = ctx.auth.store.create_session(&user.id, "web", "", &ctx.browser(), &ctx.ip, auth::WEB_TTL_MS)?;
     let target = match device {
         Some(code) => format!("/admin/#/device?code={}", encode(&code)),
         None => next,
