@@ -1,0 +1,4 @@
+node_modules/
+src-tauri/admin-dist/*
+!src-tauri/admin-dist/.gitkeep
+.DS_Store
