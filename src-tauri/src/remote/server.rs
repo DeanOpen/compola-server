@@ -611,9 +611,9 @@ async fn dispatch(remote: &Remote, who: &Who, cmd: &str, args: &Value) -> Result
     let list = |k: &str| args.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
     let target_method = format!("{}.{}", text("target"), text("method"));
 
-    let kind = {
+    let (kind, described) = {
         let mirror = remote.mirror.read();
-        policy::check_call(&access, &mirror, cmd, args)
+        (policy::check_call(&access, &mirror, cmd, args), policy::describe_call(&mirror, cmd, args))
     };
     let kind = match kind {
         Ok(k) => k,
@@ -658,10 +658,18 @@ async fn dispatch(remote: &Remote, who: &Who, cmd: &str, args: &Value) -> Result
         "automation_search" | "automation_search_status" | "automation_conversations" | "automation_messages" => automation(remote, cmd, args).await,
         _ => Err(format!("Lệnh «{cmd}» không dùng được khi kết nối qua Compola Server.")),
     };
-    if kind == CallKind::Write {
-        let ok = result.is_ok();
-        let action = if cmd == "engine_call" || cmd == "engine_call_with_files" { format!("call.{target_method}") } else { format!("call.{cmd}") };
-        audit(remote, who, &action, "", json!({ "ok": ok }));
+    // Who did what on the Zalo account (docs: "Activity tracking"); administration stays in the audit log.
+    if let Some(info) = described {
+        let device_kind = if who.session.kind == "web" { "web" } else { "device" };
+        let actor = super::Actor {
+            user: Some((who.user.id.clone(), who.user.username.clone(), who.user.display_name.clone())),
+            device_id: who.session.device_id.clone(),
+            device_name: who.session.device_name.clone(),
+            device_kind: device_kind.into(),
+        };
+        remote.record_activity(actor, info, &target_method, result.is_ok());
+    } else if kind == CallKind::Write {
+        audit(remote, who, &format!("call.{target_method}"), "", json!({ "ok": result.is_ok() }));
     }
     let result = result?;
     // Undo ids, group members, mention candidates… the policy needs to check later calls.

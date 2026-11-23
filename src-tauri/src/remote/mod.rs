@@ -225,6 +225,17 @@ pub struct Remote {
     serving: std::sync::atomic::AtomicBool,
     /// The host app's own sign-in to its server (the owner), for the native admin screens (`remote_api`).
     owner_token: Mutex<Option<String>>,
+    /// The signed-in Zalo uid of the host (from the renderer's profile), recorded with activity.
+    account_uid: Mutex<String>,
+}
+
+/// Who performed an action (activity tracking): a server user on a device / the web, or the host app itself.
+pub struct Actor {
+    pub user: Option<(String, String, String)>,
+    pub device_id: String,
+    pub device_name: String,
+    /// `device` | `web` | `host`
+    pub device_kind: String,
 }
 
 impl Remote {
@@ -267,6 +278,7 @@ impl Remote {
             join_cancel: Mutex::new(None),
             serving: std::sync::atomic::AtomicBool::new(false),
             owner_token: Mutex::new(None),
+            account_uid: Mutex::new(String::new()),
         })
     }
 
@@ -511,6 +523,46 @@ impl Remote {
             .ok_or_else(|| "Tạo tài khoản quản trị trước.".to_owned())
     }
 
+    /// Records one attributed action; a successful send also gets its response time (since the oldest unanswered
+    /// inbound message of the conversation) and closes that wait.
+    fn record_activity(&self, actor: Actor, info: policy::CallInfo, call: &str, ok: bool) {
+        let Some(auth) = self.auth() else { return };
+        let now = store::now_ms();
+        let sends = matches!(info.action, "message.send" | "message.media" | "message.file" | "message.sticker" | "message.card");
+        let (response_ms, conversation_name) = {
+            let mut mirror = self.mirror.write();
+            let name = info.conversation.as_deref().and_then(|c| mirror.conversation_name(c));
+            let response = match (&info.conversation, ok && sends) {
+                (Some(c), true) => {
+                    let r = mirror.pending_since(c).map(|t| (now - t).max(0));
+                    mirror.note_outbound(c, now);
+                    r
+                }
+                _ => None,
+            };
+            (response, name)
+        };
+        let mut detail = json!({ "call": call });
+        if info.conversations.len() > 1 || (info.conversations.len() == 1 && info.conversation.as_ref() != info.conversations.first()) {
+            detail["conversations"] = json!(info.conversations);
+        }
+        auth.store.add_activity(store::NewActivity {
+            account: String::new(),
+            account_uid: self.account_uid.lock().clone(),
+            user: actor.user,
+            device_id: actor.device_id,
+            device_name: actor.device_name,
+            device_kind: actor.device_kind,
+            action: info.action.to_owned(),
+            conversation_id: info.conversation,
+            conversation_name,
+            message_id: info.message,
+            ok,
+            response_ms,
+            detail,
+        });
+    }
+
     fn save_join(&self, join: JoinConfig) -> Result<(), String> {
         let last = LastJoin { url: join.url.clone(), device_name: join.device_name.clone(), username: join.username.clone() };
         self.update_config(|c| {
@@ -540,6 +592,12 @@ pub fn forward_event<S: Serialize>(app: &AppHandle, event: &str, payload: &S) {
     }
     let Ok(value) = serde_json::to_value(payload) else { return };
     if event == "compola://state" {
+        if let Some(uid) = value.pointer("/user/userId").and_then(Value::as_str).filter(|u| !u.is_empty()) {
+            let mut current = remote.account_uid.lock();
+            if *current != uid {
+                *current = uid.to_owned();
+            }
+        }
         remote.mirror.write().observe(&value);
     } else if event == "compola://page" && matches!(value.as_str(), Some("main" | "Main")) {
         remote.mirror.write().reset();
@@ -547,6 +605,18 @@ pub fn forward_event<S: Serialize>(app: &AppHandle, event: &str, payload: &S) {
     if remote.hub.has_clients() {
         remote.hub.publish(event, value);
     }
+}
+
+/// The host app's own adapter calls (its UI, not a joined user): recorded as `host` activity while the server runs.
+pub fn record_local_call(app: &AppHandle, cmd: &str, target: &str, method: &str, args: &[Value], ok: bool) {
+    let Some(remote) = app.try_state::<Arc<Remote>>() else { return };
+    if remote.client.is_some() || !remote.serving.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let call_args = json!({ "target": target, "method": method, "args": args });
+    let Some(info) = policy::describe_call(&remote.mirror.read(), cmd, &call_args) else { return };
+    let actor = Actor { user: None, device_id: String::new(), device_name: computer_name(), device_kind: "host".into() };
+    remote.record_activity(actor, info, &format!("{target}.{method}"), ok);
 }
 
 /// `$znoti.createNotification` hook: joined users who may see the conversation get it too.
