@@ -194,6 +194,117 @@ pub struct UserPatch {
     pub disabled: Option<bool>,
 }
 
+/// One attributed action on the Zalo account (docs/compola-server.md, "Activity tracking").
+#[derive(Clone, Debug, Default)]
+pub struct NewActivity {
+    pub account: String,
+    pub user: Option<(String, String, String)>, // id, username, display name
+    pub device_id: String,
+    pub device_name: String,
+    /// `device` | `web` | `host`
+    pub device_kind: String,
+    pub action: String,
+    pub conversation_id: Option<String>,
+    pub conversation_name: Option<String>,
+    pub message_id: Option<String>,
+    pub ok: bool,
+    pub response_ms: Option<i64>,
+    pub detail: Value,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ActivityFilter {
+    pub user_id: Option<String>,
+    pub account: Option<String>,
+    pub conversation_id: Option<String>,
+    /// Exact action or a prefix (`message` matches `message.send`).
+    pub action: Option<String>,
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+    pub limit: Option<i64>,
+    pub before: Option<i64>,
+}
+
+const ACTIVITY_COLS: &str = "id, at, account, user_id, username, display_name, device_id, device_name, device_kind, action, conversation_id, conversation_name, message_id, ok, response_ms, detail";
+const ACTIVITY_WHERE: &str = "(?1 IS NULL OR user_id = ?1) AND (?2 IS NULL OR account = ?2) AND (?3 IS NULL OR conversation_id = ?3)
+  AND (?4 IS NULL OR action = ?4 OR action LIKE ?4 || '.%') AND (?5 IS NULL OR at >= ?5) AND (?6 IS NULL OR at < ?6)";
+
+fn activity_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let user_id: Option<String> = r.get(3)?;
+    let detail: String = r.get(15)?;
+    let conversation: Option<String> = r.get(10)?;
+    Ok(json!({
+        "id": r.get::<_, i64>(0)?,
+        "at": r.get::<_, i64>(1)?,
+        "account": r.get::<_, String>(2)?,
+        "user": user_id.map(|id| json!({ "id": id, "username": r.get::<_, Option<String>>(4).ok().flatten(), "displayName": r.get::<_, Option<String>>(5).ok().flatten() })),
+        "device": { "id": r.get::<_, String>(6)?, "name": r.get::<_, String>(7)?, "kind": r.get::<_, String>(8)? },
+        "action": r.get::<_, String>(9)?,
+        "conversation": conversation.map(|id| json!({ "id": id, "name": r.get::<_, Option<String>>(11).ok().flatten() })),
+        "messageId": r.get::<_, Option<String>>(12)?,
+        "ok": r.get::<_, bool>(13)?,
+        "responseMs": r.get::<_, Option<i64>>(14)?,
+        "detail": serde_json::from_str::<Value>(&detail).unwrap_or(Value::Null),
+    }))
+}
+
+/// Stats of a group of activity rows.
+#[derive(Default)]
+struct Tally {
+    label: String,
+    sent: i64,
+    media: i64,
+    recalled: i64,
+    reactions: i64,
+    reads: i64,
+    opens: i64,
+    conversations: std::collections::HashSet<String>,
+    responses: Vec<i64>,
+}
+
+impl Tally {
+    fn add(&mut self, action: &str, conversation: Option<&str>, response_ms: Option<i64>) {
+        match action {
+            "message.send" | "message.sticker" | "message.card" | "message.forward" => self.sent += 1,
+            "message.media" | "message.file" => {
+                self.sent += 1;
+                self.media += 1;
+            }
+            "message.recall" => self.recalled += 1,
+            "message.react" => self.reactions += 1,
+            "conversation.read" => self.reads += 1,
+            "conversation.open" => self.opens += 1,
+            _ => {}
+        }
+        if action.starts_with("message.") {
+            if let Some(c) = conversation {
+                self.conversations.insert(c.to_owned());
+            }
+        }
+        if let Some(ms) = response_ms {
+            self.responses.push(ms);
+        }
+    }
+
+    fn json(mut self, key: &str) -> Value {
+        self.responses.sort_unstable();
+        let n = self.responses.len();
+        let pct = |p: f64| (n > 0).then(|| self.responses[((n as f64 - 1.0) * p).round() as usize]);
+        let avg = (n > 0).then(|| self.responses.iter().sum::<i64>() / n as i64);
+        json!({
+            "key": key, "label": if self.label.is_empty() { key.to_owned() } else { self.label.clone() },
+            "sent": self.sent, "media": self.media, "recalled": self.recalled, "reactions": self.reactions,
+            "reads": self.reads, "opens": self.opens, "conversations": self.conversations.len(), "responses": n,
+            "avgResponseMs": avg, "medianResponseMs": pct(0.5), "p90ResponseMs": pct(0.9),
+        })
+    }
+}
+
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_owned() }
+}
+
 // ---- store ----
 
 pub struct Store {
@@ -230,6 +341,15 @@ CREATE TABLE IF NOT EXISTS audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, user_id TEXT, username TEXT, action TEXT NOT NULL,
   target TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '{}', ip TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS audit_at ON audit(id DESC);
+CREATE TABLE IF NOT EXISTS activity(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, account TEXT NOT NULL DEFAULT '',
+  user_id TEXT, username TEXT, display_name TEXT,
+  device_id TEXT NOT NULL DEFAULT '', device_name TEXT NOT NULL DEFAULT '', device_kind TEXT NOT NULL DEFAULT 'device',
+  action TEXT NOT NULL, conversation_id TEXT, conversation_name TEXT, message_id TEXT,
+  ok INTEGER NOT NULL DEFAULT 1, response_ms INTEGER, detail TEXT NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS activity_at ON activity(at);
+CREATE INDEX IF NOT EXISTS activity_user ON activity(user_id, at);
+CREATE INDEX IF NOT EXISTS activity_conv ON activity(conversation_id, at);
 ";
 
 /// Audit entries kept.
@@ -852,6 +972,112 @@ impl Store {
         Ok(rows)
     }
 
+    // ---- activity ----
+
+    pub fn add_activity(&self, a: NewActivity) {
+        let c = self.conn.lock();
+        let (user_id, username, display) = a.user.map(|(i, u, d)| (Some(i), Some(u), Some(d))).unwrap_or((None, None, None));
+        let r = c.execute(
+            &format!("INSERT INTO activity({}) VALUES(NULL,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", ACTIVITY_COLS),
+            params![
+                now_ms(), a.account, user_id, username, display, a.device_id, a.device_name, a.device_kind, a.action,
+                a.conversation_id, a.conversation_name, a.message_id, a.ok, a.response_ms, a.detail.to_string()
+            ],
+        );
+        if let Err(e) = r {
+            log::warn!("compola server: activity not recorded: {e}");
+        }
+    }
+
+    pub fn activity(&self, f: &ActivityFilter) -> Result<Vec<Value>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(&format!(
+            "SELECT {ACTIVITY_COLS} FROM activity WHERE {ACTIVITY_WHERE} AND (?7 IS NULL OR id < ?7) ORDER BY id DESC LIMIT ?8"
+        ))?;
+        let rows = st
+            .query_map(
+                params![f.user_id, f.account, f.conversation_id, f.action, f.from, f.to, f.before, f.limit.unwrap_or(100).clamp(1, 1000)],
+                activity_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Totals and groups (`user` | `day` | `account` | `conversation`) of the filtered activity.
+    pub fn activity_stats(&self, f: &ActivityFilter, group_by: &str) -> Result<Value> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(&format!(
+            "SELECT at, account, user_id, COALESCE(display_name, username, ''), action, conversation_id, COALESCE(conversation_name, ''), response_ms
+             FROM activity WHERE {ACTIVITY_WHERE} AND ok = 1"
+        ))?;
+        let mut groups: std::collections::BTreeMap<String, Tally> = std::collections::BTreeMap::new();
+        let mut totals = Tally::default();
+        let mut rows = st.query(params![f.user_id, f.account, f.conversation_id, f.action, f.from, f.to])?;
+        while let Some(r) = rows.next()? {
+            let at: i64 = r.get(0)?;
+            let account: String = r.get(1)?;
+            let user: Option<String> = r.get(2)?;
+            let user_label: String = r.get(3)?;
+            let action: String = r.get(4)?;
+            let conversation: Option<String> = r.get(5)?;
+            let conversation_label: String = r.get(6)?;
+            let response: Option<i64> = r.get(7)?;
+            let (key, label) = match group_by {
+                "day" => {
+                    use chrono::TimeZone;
+                    let day = chrono::Local.timestamp_millis_opt(at).single().map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
+                    (day, String::new())
+                }
+                "account" => (account.clone(), String::new()),
+                "conversation" => match &conversation {
+                    Some(c) => (c.clone(), conversation_label.clone()),
+                    None => continue,
+                },
+                _ => (user.clone().unwrap_or_else(|| "host".into()), if user.is_some() { user_label } else { "Máy chủ".into() }),
+            };
+            let g = groups.entry(key).or_default();
+            if g.label.is_empty() {
+                g.label = label;
+            }
+            g.add(&action, conversation.as_deref(), response);
+            totals.add(&action, conversation.as_deref(), response);
+        }
+        let rows: Vec<Value> = groups.into_iter().map(|(k, t)| t.json(&k)).collect();
+        Ok(json!({ "rows": rows, "totals": totals.json("total") }))
+    }
+
+    /// The filtered activity as CSV (UTF-8 with BOM, for Excel), oldest first.
+    pub fn activity_csv(&self, f: &ActivityFilter) -> Result<String> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(&format!("SELECT {ACTIVITY_COLS} FROM activity WHERE {ACTIVITY_WHERE} ORDER BY id LIMIT 1000000"))?;
+        let mut out = String::from("\u{feff}thoi_gian,tai_khoan_zalo,nguoi_dung,ten_hien_thi,thiet_bi,ma_thiet_bi,loai_thiet_bi,hanh_dong,hoi_thoai,ten_hoi_thoai,tin_nhan,thanh_cong,phan_hoi_ms\n");
+        let mut rows = st.query(params![f.user_id, f.account, f.conversation_id, f.action, f.from, f.to])?;
+        while let Some(r) = rows.next()? {
+            use chrono::TimeZone;
+            let at: i64 = r.get(1)?;
+            let when = chrono::Local.timestamp_millis_opt(at).single().map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+            let text = |i: usize| r.get::<_, Option<String>>(i).ok().flatten().unwrap_or_default();
+            let fields = [
+                when,
+                text(2),
+                text(4),
+                text(5),
+                text(7),
+                text(6),
+                text(8),
+                text(9),
+                text(10),
+                text(11),
+                text(12),
+                if r.get::<_, bool>(13)? { "1".into() } else { "0".into() },
+                r.get::<_, Option<i64>>(14)?.map(|v| v.to_string()).unwrap_or_default(),
+            ];
+            out.push_str(&fields.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(","));
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
     pub fn audit_recent_count(&self, action: &str, ip: &str, since: i64) -> Result<i64> {
         let c = self.conn.lock();
         Ok(c.query_row("SELECT COUNT(*) FROM audit WHERE action = ?1 AND ip = ?2 AND at > ?3", params![action, ip, since], |r| r.get(0))?)
@@ -914,6 +1140,46 @@ mod tests {
         assert_eq!(s.session_by_token(&token, "10.0.0.2", None).unwrap().unwrap().0.id, session.id);
         s.update_user(&u.id, UserPatch { disabled: Some(true), ..Default::default() }).unwrap();
         assert!(s.session_by_token(&token, "10.0.0.2", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn activity_is_filtered_grouped_and_exported() {
+        let s = Store::memory();
+        let add = |user: &str, action: &str, conv: &str, ms: Option<i64>| {
+            s.add_activity(NewActivity {
+                user: Some((user.into(), user.into(), user.to_uppercase())),
+                device_kind: "device".into(),
+                action: action.into(),
+                conversation_id: Some(conv.into()),
+                conversation_name: Some(format!("Khách, {conv}")),
+                ok: true,
+                response_ms: ms,
+                detail: json!({}),
+                ..Default::default()
+            })
+        };
+        add("lan", "message.send", "c1", Some(60_000));
+        add("lan", "message.send", "c2", Some(120_000));
+        add("lan", "message.react", "c1", None);
+        add("minh", "message.media", "c1", Some(30_000));
+        add("minh", "conversation.open", "c3", None);
+        let all = ActivityFilter::default();
+        assert_eq!(s.activity(&all).unwrap().len(), 5);
+        let lan = ActivityFilter { user_id: Some("lan".into()), ..Default::default() };
+        assert_eq!(s.activity(&lan).unwrap().len(), 3);
+        let messages = ActivityFilter { action: Some("message".into()), ..Default::default() };
+        assert_eq!(s.activity(&messages).unwrap().len(), 4);
+        let stats = s.activity_stats(&all, "user").unwrap();
+        assert_eq!(stats["totals"]["sent"], json!(3));
+        assert_eq!(stats["totals"]["conversations"], json!(2));
+        assert_eq!(stats["totals"]["medianResponseMs"], json!(60_000));
+        let lan_row = stats["rows"].as_array().unwrap().iter().find(|r| r["key"] == json!("lan")).unwrap().clone();
+        assert_eq!(lan_row["label"], json!("LAN"));
+        assert_eq!(lan_row["avgResponseMs"], json!(90_000));
+        let csv = s.activity_csv(&all).unwrap();
+        assert!(csv.starts_with('\u{feff}'));
+        assert_eq!(csv.lines().count(), 6);
+        assert!(csv.contains("\"Khách, c1\""));
     }
 
     #[test]

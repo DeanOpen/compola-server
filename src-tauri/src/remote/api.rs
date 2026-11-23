@@ -581,6 +581,27 @@ async fn admin_route(ctx: &Ctx<'_>, admin: &User, method: &str, seg: &[&str]) ->
             Ok(Reply::ok(json!(store.audit_entries(limit, before, user_id.as_deref(), action.as_deref())?)))
         }
 
+        // per-staff activity (docs: "Activity tracking")
+        ("GET", ["activity"]) => Ok(Reply::ok(json!(store.activity(&activity_filter(ctx))?))),
+        ("GET", ["activity", "stats"]) => {
+            let group_by = ctx.head.param("groupBy").unwrap_or_else(|| "user".into());
+            Ok(Reply::ok(store.activity_stats(&activity_filter(ctx), &group_by)?))
+        }
+        ("GET", ["activity", "export.csv"]) => {
+            let csv = store.activity_csv(&activity_filter(ctx))?;
+            ctx.audit(admin, "activity.export", "", json!({}));
+            let name = format!("compola-hoat-dong-{}.csv", chrono::Local::now().format("%Y%m%d-%H%M"));
+            Ok(Reply {
+                status: 200,
+                headers: vec![
+                    ("Content-Type".into(), "text/csv; charset=utf-8".into()),
+                    ("Content-Disposition".into(), format!("attachment; filename=\"{name}\"")),
+                    ("Cache-Control".into(), "no-store".into()),
+                ],
+                body: csv.into_bytes(),
+            })
+        }
+
         // the host's Zalo account: status, sign-in by QR, sign-out (a host can be run headless / from afar)
         ("GET", ["zalo"]) => {
             let engine = remote.engine().ok_or_else(|| StoreError::new(503, "Engine chưa chạy."))?;
@@ -622,6 +643,21 @@ async fn admin_route(ctx: &Ctx<'_>, admin: &User, method: &str, seg: &[&str]) ->
             Ok(Reply::ok(remote.server_info_json()))
         }
         _ => Err(StoreError::new(404, "Không có API này.")),
+    }
+}
+
+fn activity_filter(ctx: &Ctx<'_>) -> super::store::ActivityFilter {
+    let text = |k: &str| ctx.head.param(k).filter(|v| !v.is_empty());
+    let num = |k: &str| text(k).and_then(|v| v.parse::<i64>().ok());
+    super::store::ActivityFilter {
+        user_id: text("userId"),
+        account: ctx.head.param("account"),
+        conversation_id: text("conversationId"),
+        action: text("action"),
+        from: num("from"),
+        to: num("to"),
+        limit: num("limit"),
+        before: num("before"),
     }
 }
 

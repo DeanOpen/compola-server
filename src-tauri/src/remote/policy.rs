@@ -82,6 +82,7 @@ const MAX_PEOPLE: usize = 30_000;
 /// Conversations remembered per person.
 const MAX_PEOPLE_CONVERSATIONS: usize = 8;
 const MAX_TOKENS: usize = 512;
+const MAX_REPLIES: usize = 50_000;
 
 /// A map that forgets its oldest keys (insertion order) beyond `cap`.
 struct Bounded<V> {
@@ -156,7 +157,16 @@ pub struct Mirror {
     confirms: Bounded<String>,
     /// Undo id of a "delete for me" → conversation.
     undos: Bounded<String>,
+    /// Reply state per conversation (response time, [`Mirror::pending_since`]).
+    replies: Bounded<Reply>,
     generation: u64,
+}
+
+/// What a conversation waits for: the latest outbound message seen and the oldest inbound one after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Reply {
+    last_out: i64,
+    pending: Option<i64>,
 }
 
 /// A non-empty id from a string or a number.
@@ -225,6 +235,15 @@ impl Mirror {
         }
         for row in rows.as_array().into_iter().flatten() {
             if let Some(id) = id_of(row.get("id")) {
+                // The row's preview is the conversation's latest message.
+                if let Some(p) = row.get("preview").filter(|p| p.is_object()) {
+                    let ts = p.get("ts").and_then(Value::as_i64).unwrap_or(0);
+                    if p.get("fromMe").and_then(Value::as_bool).unwrap_or(false) {
+                        self.outbound(&id, ts);
+                    } else {
+                        self.inbound(&id, ts);
+                    }
+                }
                 self.rows.insert(id, row.clone());
             }
         }
@@ -271,7 +290,61 @@ impl Mirror {
         let Some(conv) = id_of(chat.get("convId")) else { return };
         for m in chat.get("messages").and_then(Value::as_array).into_iter().flatten() {
             self.learn_message(m, &conv);
+            // Messages a person wrote (not system lines, notices, recalls); full lists come oldest first.
+            if matches!(m.get("kind").map(|k| str_of(k.get("type"))), Some("system" | "notice" | "recalled")) {
+                continue;
+            }
+            let ts = m.get("date").and_then(Value::as_i64).unwrap_or(0);
+            if m.get("isMine").and_then(Value::as_bool).unwrap_or(false) {
+                self.outbound(&conv, ts);
+            } else {
+                self.inbound(&conv, ts);
+            }
         }
+    }
+
+    fn reply_mut(&mut self, conversation: &str) -> &mut Reply {
+        if self.replies.get(conversation).is_none() {
+            self.replies.insert(conversation.to_owned(), Reply::default(), MAX_REPLIES);
+        }
+        self.replies.get_mut(conversation).expect("just inserted")
+    }
+
+    /// An inbound message at `ts`: it waits for an answer unless something was sent after it.
+    fn inbound(&mut self, conversation: &str, ts: i64) {
+        if ts <= 0 || conversation.is_empty() {
+            return;
+        }
+        let r = self.reply_mut(conversation);
+        if ts > r.last_out {
+            r.pending = Some(r.pending.map_or(ts, |p| p.min(ts)));
+        }
+    }
+
+    fn outbound(&mut self, conversation: &str, ts: i64) {
+        if ts <= 0 || conversation.is_empty() {
+            return;
+        }
+        let r = self.reply_mut(conversation);
+        r.last_out = r.last_out.max(ts);
+        if r.pending.is_some_and(|p| p <= ts) {
+            r.pending = None;
+        }
+    }
+
+    /// Time (epoch ms) of the oldest inbound message of the conversation with no outbound one after it.
+    pub fn pending_since(&self, conversation: &str) -> Option<i64> {
+        self.replies.get(conversation).and_then(|r| r.pending)
+    }
+
+    /// Something was sent to the conversation at `at` (epoch ms): what waited is answered.
+    pub fn note_outbound(&mut self, conversation: &str, at: i64) {
+        self.outbound(conversation, at);
+    }
+
+    /// Display name of a conversation from its row.
+    pub fn conversation_name(&self, id: &str) -> Option<String> {
+        self.rows.get(id).map(|r| str_of(r.get("name"))).filter(|n| !n.is_empty()).map(str::to_owned)
     }
 
     /// One ChatMessageJSON (chat-adapter.js) of conversation `conv`.
