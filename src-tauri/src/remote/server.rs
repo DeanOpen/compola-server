@@ -219,6 +219,14 @@ async fn serve(remote: Arc<Remote>, stream: TcpStream, peer: SocketAddr) {
                 }
                 Err(e) => Err(e),
             }
+        } else if path == "/web" || path.starts_with("/web/") {
+            match conn.skip_body(length).await {
+                Ok(()) => {
+                    let reply = super::api::web_file(&path);
+                    conn.respond(reply.status, &reply.headers, &reply.body, method == "HEAD", close).await
+                }
+                Err(e) => Err(e),
+            }
         } else if path == "/admin" || path.starts_with("/admin/") {
             match conn.skip_body(length).await {
                 Ok(()) => {
@@ -271,15 +279,48 @@ async fn serve(remote: Arc<Remote>, stream: TcpStream, peer: SocketAddr) {
     }
 }
 
+/// The session of a joined app (bearer device token) or of the web client (the console's cookie). A cookie is only
+/// accepted from this server's own pages: same `Origin` (WebSocket, uploads), and uploads also need `X-Compola: 1`;
+/// plain media GETs rely on the cookie's SameSite=Lax.
 fn device_session(remote: &Remote, head: &Head, ip: &str) -> Option<(Session, User, Access)> {
-    let token = head.bearer()?;
     let auth = remote.auth()?;
-    let (session, user) = auth.store.session_by_token(token, ip, Some(super::auth::DEVICE_TTL_MS)).ok()??;
-    if session.kind != "device" {
-        return None;
-    }
+    let (session, user) = if let Some(token) = head.bearer() {
+        let (s, u) = auth.store.session_by_token(token, ip, Some(super::auth::DEVICE_TTL_MS)).ok()??;
+        if s.kind != "device" {
+            return None;
+        }
+        (s, u)
+    } else {
+        let token = super::api::request_token(head)?;
+        let needs_origin = head.is_websocket_upgrade() || head.method != "GET" && head.method != "HEAD";
+        if needs_origin && !same_origin(head) {
+            return None;
+        }
+        if head.method == "POST" && head.header("x-compola") != Some("1") {
+            return None;
+        }
+        let (s, u) = auth.store.session_by_token(&token, ip, None).ok()??;
+        if s.kind != "web" {
+            return None;
+        }
+        (s, u)
+    };
     let access = auth.store.access_of(&user).ok()?.0?;
     Some((session, user, access))
+}
+
+/// `Origin` names the host the request was sent to (Cross-Site WebSocket Hijacking / CSRF guard).
+fn same_origin(head: &Head) -> bool {
+    let (Some(origin), Some(host)) = (head.header("origin"), head.header("host")) else { return false };
+    let forwarded = head.header("x-forwarded-host").map(|h| h.split(',').next().unwrap_or_default().trim());
+    url::Url::parse(origin).ok().is_some_and(|o| {
+        let authority = match (o.host_str(), o.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_owned(),
+            _ => return false,
+        };
+        authority.eq_ignore_ascii_case(host) || forwarded.is_some_and(|f| authority.eq_ignore_ascii_case(f))
+    })
 }
 
 /// Local files a joined user may load: downloaded media (`…/ZaloDownloads/…`), the media cache and the zCloud cache.
@@ -681,6 +722,22 @@ mod tests {
         assert!(remote_may_read(&other));
         std::fs::remove_file(other).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cookie_requests_must_come_from_this_server() {
+        let head = |origin: Option<&str>, host: &str| Head {
+            method: "GET".into(),
+            target: "/ws".into(),
+            headers: [Some(("Host".to_owned(), host.to_owned())), origin.map(|o| ("Origin".to_owned(), o.to_owned()))].into_iter().flatten().collect(),
+            http10: false,
+        };
+        assert!(same_origin(&head(Some("http://192.168.1.5:39218"), "192.168.1.5:39218")));
+        assert!(same_origin(&head(Some("https://compola.example.com"), "compola.example.com")));
+        assert!(!same_origin(&head(Some("https://evil.example"), "192.168.1.5:39218")));
+        assert!(!same_origin(&head(Some("http://192.168.1.5:39219"), "192.168.1.5:39218")));
+        assert!(!same_origin(&head(None, "192.168.1.5:39218")));
+        assert!(!same_origin(&head(Some("null"), "192.168.1.5:39218")));
     }
 
     #[test]

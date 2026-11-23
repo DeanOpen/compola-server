@@ -14,6 +14,8 @@ use super::policy::{Role, Scope};
 use super::store::{Session, StoreError, Subject, User, UserPatch};
 
 static ADMIN: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/admin-dist");
+/// The Compola UI as a web client (`npm run build:web`).
+static WEB: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web-dist");
 
 pub const COOKIE: &str = "compola_session";
 /// Largest JSON body.
@@ -158,7 +160,8 @@ pub fn browser_label(ua: &str) -> String {
 
 /// `next` must stay inside the admin console (no open redirect).
 fn safe_next(next: Option<String>) -> String {
-    next.filter(|n| n.starts_with("/admin/") && !n.starts_with("//") && !n.contains(['\r', '\n', '\\'])).unwrap_or_else(|| "/admin/".into())
+    next.filter(|n| (n.starts_with("/admin/") || n.starts_with("/web/")) && !n.starts_with("//") && !n.contains(['\r', '\n', '\\']))
+        .unwrap_or_else(|| "/admin/".into())
 }
 
 fn encode(s: &str) -> String {
@@ -666,28 +669,42 @@ fn activity_filter(ctx: &Ctx<'_>) -> super::store::ActivityFilter {
 const ADMIN_MISSING: &str = "<!doctype html><meta charset=utf-8><title>Compola Server</title><body style=\"font-family:system-ui;padding:40px\">\
 <h1>Compola Server</h1><p>Trang quản trị chưa được build. Chạy <code>npm run build:admin</code> rồi build lại ứng dụng.</p>";
 
+const WEB_MISSING: &str = "<!doctype html><meta charset=utf-8><title>Compola</title><body style=\"font-family:system-ui;padding:40px\">\
+<h1>Compola</h1><p>Bản web chưa được build. Chạy <code>npm run build:web</code> rồi build lại ứng dụng.</p>";
+
 pub fn admin_file(path: &str) -> Reply {
-    let rel = path.trim_start_matches("/admin").trim_start_matches('/');
+    static_file(&ADMIN, path.trim_start_matches("/admin"), ADMIN_MISSING, "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+}
+
+/// `/web/*`: the Compola UI in the browser (it signs in through the console, then talks to `/ws`).
+pub fn web_file(path: &str) -> Reply {
+    static_file(
+        &WEB,
+        path.trim_start_matches("/web"),
+        WEB_MISSING,
+        "default-src 'self'; img-src 'self' data: blob: https:; media-src 'self' blob: https:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    )
+}
+
+fn static_file(dir: &Dir<'_>, rel: &str, missing: &str, csp: &str) -> Reply {
+    let rel = rel.trim_start_matches('/');
     let security = [
         ("X-Content-Type-Options", "nosniff"),
         ("X-Frame-Options", "DENY"),
         ("Referrer-Policy", "no-referrer"),
-        (
-            "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-        ),
+        ("Content-Security-Policy", csp),
     ];
-    let (file, cache) = match (!rel.is_empty()).then(|| ADMIN.get_file(rel)).flatten() {
+    let (file, cache) = match (!rel.is_empty()).then(|| dir.get_file(rel)).flatten() {
         Some(f) => (Some(f), if rel.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" }),
         // SPA: unknown paths get index.html.
-        None => (ADMIN.get_file("index.html"), "no-cache"),
+        None => (dir.get_file("index.html"), "no-cache"),
     };
     let mut reply = match file {
         Some(f) => {
             let mime = mime_guess::from_path(f.path()).first_or_octet_stream().to_string();
             Reply { status: 200, headers: vec![("Content-Type".into(), mime), ("Cache-Control".into(), cache.into())], body: f.contents().to_vec() }
         }
-        None => Reply { status: 200, headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())], body: ADMIN_MISSING.as_bytes().to_vec() },
+        None => Reply { status: 200, headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())], body: missing.as_bytes().to_vec() },
     };
     reply.headers.extend(security.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
     reply

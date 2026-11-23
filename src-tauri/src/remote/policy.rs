@@ -1193,6 +1193,124 @@ pub fn filter_result(access: &Access, mirror: &Mirror, cmd: &str, args: &Value, 
     }
 }
 
+// ---- activity ----
+
+/// What a call did, for the activity log (docs/compola-server.md, "Activity tracking").
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallInfo {
+    pub action: &'static str,
+    /// The conversation acted in.
+    pub conversation: Option<String>,
+    /// Further conversations (forward / share targets, pins replaced).
+    pub conversations: Vec<String>,
+    pub message: Option<String>,
+}
+
+/// The activity of one `engine_call` / `engine_call_with_files`: None for reads (except opening a conversation),
+/// follow-ups of an earlier action (undo / commit of a delete) and everything unknown.
+pub fn describe_call(mirror: &Mirror, cmd: &str, args: &Value) -> Option<CallInfo> {
+    if cmd != "engine_call" && cmd != "engine_call_with_files" {
+        return None;
+    }
+    let list = args.get("args").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let at = |i: usize| arg(list, i);
+    let all = |i: usize| -> Vec<String> { list.get(i).and_then(Value::as_array).into_iter().flatten().filter_map(|c| id_of(Some(c))).collect() };
+    let info = |action: &'static str, conversation: Option<String>| CallInfo { action, conversation, conversations: Vec::new(), message: None };
+    // Conversation at 0 (else the one the mirror knows for the message), message at 1.
+    let on_message = |action: &'static str| {
+        let message = at(1);
+        let conversation = at(0).or_else(|| message.as_ref().and_then(|m| mirror.messages.get(m).cloned()));
+        CallInfo { action, conversation, conversations: Vec::new(), message }
+    };
+    let c0 = || at(0);
+    let described = match (str_of(args.get("target")), str_of(args.get("method"))) {
+        ("__zaloChat", "open") => info("conversation.open", c0()),
+        ("__zaloChat", "sendText") => info("message.send", c0()),
+        ("__zaloChat", "markRead") => info("conversation.read", c0()),
+        ("__zaloChat", "react") => on_message("message.react"),
+        ("__zaloChat", "performAction") => on_message("message.action"),
+        ("__zaloChat", "reminderRespond") => on_message("reminder.respond"),
+        ("__zaloChat", "stickerCategorySend") => info("message.sticker", c0()),
+        ("__zaloChat", "aliasSave") => info("contact.alias", c0()),
+        ("__zaloChat", "groupJoin") => info("group.join", None),
+
+        ("__zaloCompose", "sendMedia") => info("message.media", c0()),
+        ("__zaloCompose", "sendShot") => {
+            let to_me = truthy(list.get(1)) && !mirror.self_conversation.is_empty();
+            info("message.media", if to_me { Some(mirror.self_conversation.clone()) } else { c0() })
+        }
+        ("__zaloCompose", "shareShot") => {
+            let targets = all(0);
+            CallInfo { action: "message.media", conversation: targets.first().cloned(), conversations: targets, message: None }
+        }
+        ("__zaloCompose", "sendFiles") => info("message.file", c0()),
+        ("__zaloCompose", "sendMyCard") => info("message.card", c0()),
+        ("__zaloCompose", "createReminder") => info("reminder.create", c0()),
+        ("__zaloCompose", "answer") => info("message.confirm", at(0).and_then(|t| mirror.confirms.get(&t).cloned())),
+
+        ("__zaloMsgActions", "forward") => CallInfo { conversations: all(2), ..on_message("message.forward") },
+        ("__zaloMsgActions", "recall") => on_message("message.recall"),
+        ("__zaloMsgActions", "deleteForMe") => on_message("message.delete"),
+        ("__zaloMsgActions", "star") => on_message("message.star"),
+        ("__zaloMsgActions", "pin") => on_message("message.pin"),
+        ("__zaloMsgActions", "unpin") => info("message.unpin", c0()),
+
+        ("__zaloConvActions", "pin") => info("conversation.pin", c0()),
+        ("__zaloConvActions", "pinReplacing") => CallInfo { conversations: all(0), ..info("conversation.pin", at(1)) },
+        ("__zaloConvActions", "unpin") => info("conversation.unpin", c0()),
+        ("__zaloConvActions", "archive") => info("conversation.archive", c0()),
+        ("__zaloConvActions", "unarchive") => info("conversation.unarchive", c0()),
+        ("__zaloConvActions", "deleteConversation") => info("conversation.delete", c0()),
+        ("__zaloConvActions", "markRead") => info("conversation.read", c0()),
+        ("__zaloConvActions", "markUnread") => info("conversation.unread", c0()),
+        ("__zaloConvActions", "hide" | "hideWithNewPin") => info("conversation.hide", c0()),
+        ("__zaloConvActions", "unhide") => info("conversation.unhide", c0()),
+        ("__zaloConvActions", "setPin" | "resetPin") => info("conversation.hiddenPin", None),
+
+        ("__zaloConversations", "setConvLabel") => info("conversation.label", c0()),
+        ("__zaloConversations", "createLabel") => CallInfo { conversations: all(2), ..info("label.create", None) },
+        ("__zaloConversations", "updateLabel") => info("label.update", None),
+        ("__zaloConversations", "deleteLabel") => info("label.delete", None),
+        ("__zaloConversations", "reorderLabels") => info("label.reorder", None),
+
+        ("__zaloNotification", "mute") => info("conversation.mute", c0()),
+        ("__zaloNotification", "unmute") => info("conversation.unmute", c0()),
+        ("__zaloNotification", "setEnabled" | "setSound") => info("settings.notification", None),
+
+        // Friend requests: the person's id is the id of the 1:1 conversation with them.
+        ("__zaloContacts", "sendRequest") => info("contact.request", c0()),
+        ("__zaloContacts", "accept") => info("contact.accept", c0()),
+        ("__zaloContacts", "decline") => info("contact.decline", c0()),
+        ("__zaloContacts", "cancel") => info("contact.cancel", c0()),
+        ("__zaloContacts", "dismissSuggestion") => info("contact.dismiss", c0()),
+        ("__zaloContacts", "block") => info("contact.block", c0()),
+        ("__zaloContacts", "acceptGroupInvite") => info("group.join", c0()),
+        ("__zaloContacts", "declineGroupInvite") => info("group.decline", c0()),
+
+        ("__zaloPoll", "create") => info("poll.create", c0()),
+        ("__zaloPoll", "vote") => info("poll.vote", c0()),
+        ("__zaloPoll", "lock") => info("poll.lock", c0()),
+        ("__zaloPoll", "share") => info("poll.share", c0()),
+        ("__zaloPoll", "pin") => info("poll.pin", c0()),
+        ("__zaloPoll", "unpin") => info("poll.unpin", c0()),
+
+        ("__zaloSticker", "send") => info("message.sticker", c0()),
+        ("__zaloSticker", "setSuggestSetting") => info("settings.sticker", None),
+
+        ("__zaloGroupCreate", "create") => info("group.create", None),
+        ("__zaloGroupCreate", "removeMember") => info("group.member", c0()),
+
+        ("__zaloCloud", "deleteItems") => info("cloud.delete", None),
+        ("__zaloCloud", "setOffload") => info("cloud.offload", None),
+
+        ("__zaloTransfer", "start") => info("transfer.start", None),
+        ("__zaloTransfer", "respond") => info("transfer.respond", None),
+        ("__zaloTransfer", "dismiss") => info("transfer.dismiss", None),
+        _ => return None,
+    };
+    Some(described)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1783,6 +1901,103 @@ mod tests {
         assert_eq!(m.conversations_json()["conversations"], json!([]));
         assert!(m.conversations_snapshot(&scoped_agent()).is_none());
         assert!(check(&scoped_agent(), &m, "__zaloPoll", "refresh", json!(["p-vip"])).is_err());
+    }
+
+    #[test]
+    fn describe_calls_for_the_activity_log() {
+        let m = mirror();
+        let d = |target: &str, method: &str, args: Value| describe_call(&m, "engine_call", &call(target, method, args));
+        let one = |action: &'static str, conv: &str, msg: Option<&str>| {
+            Some(CallInfo { action, conversation: Some(conv.into()), conversations: vec![], message: msg.map(str::to_owned) })
+        };
+        assert_eq!(d("__zaloChat", "sendText", json!([AN, "chào", "m-an-1", [], []])), one("message.send", AN, None));
+        assert_eq!(d("__zaloChat", "open", json!([VIP])), one("conversation.open", VIP, None));
+        assert_eq!(d("__zaloChat", "react", json!([AN, "m-an-1", "❤️"])), one("message.react", AN, Some("m-an-1")));
+        assert_eq!(d("__zaloChat", "react", json!([null, "m-binh-1", "❤️"])), one("message.react", BINH, Some("m-binh-1")));
+        assert_eq!(d("__zaloMsgActions", "recall", json!([AN, "m-an-1"])), one("message.recall", AN, Some("m-an-1")));
+        assert_eq!(d("__zaloMsgActions", "deleteForMe", json!([AN, "m-an-1", true])), one("message.delete", AN, Some("m-an-1")));
+        assert_eq!(d("__zaloMsgActions", "undoDelete", json!(["7"])), None);
+        assert_eq!(d("__zaloMsgActions", "commitDelete", json!(["7"])), None);
+        assert_eq!(
+            d("__zaloMsgActions", "forward", json!([AN, "m-an-1", [VIP, BINH]])),
+            Some(CallInfo { action: "message.forward", conversation: Some(AN.into()), conversations: vec![VIP.into(), BINH.into()], message: Some("m-an-1".into()) })
+        );
+        assert_eq!(d("__zaloCompose", "sendMedia", json!([AN])), one("message.media", AN, None));
+        assert_eq!(d("__zaloCompose", "sendShot", json!([AN, true])), one("message.media", CLOUD, None));
+        assert_eq!(d("__zaloCompose", "sendFiles", json!([AN])), one("message.file", AN, None));
+        assert_eq!(d("__zaloSticker", "send", json!([VIP, { "cateId": 1, "id": 2 }, "category", {}])), one("message.sticker", VIP, None));
+        assert_eq!(d("__zaloCompose", "sendMyCard", json!([AN, false])), one("message.card", AN, None));
+        assert_eq!(d("__zaloConvActions", "markUnread", json!([AN])), one("conversation.unread", AN, None));
+        assert_eq!(d("__zaloChat", "markRead", json!([AN])), one("conversation.read", AN, None));
+        assert_eq!(d("__zaloNotification", "mute", json!([AN, 1])), one("conversation.mute", AN, None));
+        assert_eq!(d("__zaloPoll", "vote", json!([VIP, "p-vip", [], ["1"]])), one("poll.vote", VIP, None));
+        assert_eq!(d("__zaloCompose", "createReminder", json!([VIP, { "title": "Họp" }])), one("reminder.create", VIP, None));
+        assert_eq!(d("__zaloGroupCreate", "removeMember", json!([VIP, "2400", false])), one("group.member", VIP, None));
+        assert_eq!(d("__zaloContacts", "sendRequest", json!(["2300", "Chào"])), one("contact.request", "2300", None));
+        // Reads other than opening a conversation, unknown calls and other commands: nothing.
+        for (t, method) in [("__zaloChat", "loadMore"), ("__zaloChat", "resolveMedia"), ("__zaloMsgActions", "pins"), ("__zaloChat", "newThing"), ("__zaloStore", "dispatch")] {
+            assert_eq!(d(t, method, json!([AN])), None, "{t}.{method}");
+        }
+        assert_eq!(describe_call(&m, "engine_replay", &json!({})), None);
+        let files = json!({ "target": "__zaloCompose", "method": "sendFiles", "args": [AN], "files": [] });
+        assert_eq!(describe_call(&m, "engine_call_with_files", &files), one("message.file", AN, None));
+    }
+
+    #[test]
+    fn every_classified_write_is_described() {
+        let m = mirror();
+        let quiet = ["undoDelete", "commitDelete", "dropDelete"];
+        for (t, method, op, _) in RULES {
+            if *op == Write && !quiet.contains(method) {
+                assert!(describe_call(&m, "engine_call", &call(t, method, json!([AN, "m-an-1", [VIP]]))).is_some(), "{t}.{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn pending_reply_from_rows_chat_and_sends() {
+        let mut m = Mirror::default();
+        let row_at = |id: &str, ts: i64, from_me: bool| {
+            let mut r = row(id, "X", false, 1, "…");
+            r["preview"]["ts"] = json!(ts);
+            r["preview"]["fromMe"] = json!(from_me);
+            json!({ "page": "main", "conversations": [r], "removed": [], "reset": false })
+        };
+        // Customer writes at 1000 and 2000: the oldest unanswered one counts.
+        m.observe(&row_at(AN, 1000, false));
+        m.observe(&row_at(AN, 2000, false));
+        assert_eq!(m.pending_since(AN), Some(1000));
+        // Re-posted row (unread / pin change): nothing moves.
+        m.observe(&row_at(AN, 2000, false));
+        assert_eq!(m.pending_since(AN), Some(1000));
+        // We answered.
+        m.note_outbound(AN, 2500);
+        assert_eq!(m.pending_since(AN), None);
+        m.observe(&row_at(AN, 2500, true));
+        assert_eq!(m.pending_since(AN), None);
+        // Old messages (a chat loaded later) do not reopen it; a new one does.
+        let mut old = message(AN, "o1", AN, "cũ");
+        old["date"] = json!(1500);
+        let mut new = message(AN, "n1", AN, "mới");
+        new["date"] = json!(3000);
+        m.observe(&chat(AN, json!([old, new])));
+        assert_eq!(m.pending_since(AN), Some(3000));
+
+        // A full chat list, oldest first: in, out, in, system line, in.
+        let at = |id: &str, ts: i64, mine: bool, kind: &str| {
+            let mut x = message(VIP, id, if mine { ME } else { "2100" }, "t");
+            x["date"] = json!(ts);
+            x["isMine"] = json!(mine);
+            x["kind"] = json!({ "type": kind });
+            x
+        };
+        m.observe(&chat(VIP, json!([at("a", 100, false, "text"), at("b", 200, true, "text"), at("c", 300, false, "photo"), at("d", 400, false, "system"), at("e", 500, false, "text")])));
+        assert_eq!(m.pending_since(VIP), Some(300));
+        assert_eq!(m.pending_since(BINH), None);
+        assert_eq!(m.conversation_name(AN).as_deref(), Some("X"));
+        assert_eq!(m.conversation_name(BINH), None);
+        m.reset();
+        assert_eq!(m.pending_since(VIP), None);
     }
 
     #[test]
