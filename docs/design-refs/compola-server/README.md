@@ -1,6 +1,6 @@
 # Compola Server — design references (Mobbin)
 
-Patterns, not skins: everything stays in the Zalo PC look (docs/zalo-pc-style.md). Do not copy other products' branding.
+Patterns, not skins: do not copy other products' branding. The desktop screens stay in the Zalo PC look (docs/zalo-pc-style.md); the admin console has its own enterprise style (see Admin console).
 
 ## Desktop
 
@@ -27,7 +27,25 @@ separately, "Thiết bị: <deviceName> · #<short id>". The device name is neve
 
 `admin/` (served at `/admin/`, built into `src-tauri/admin-dist/`). Mock: `npm run dev:admin`, then
 `http://localhost:1430/admin/?mock=1` (sign in as `admin`, `lan` or `minh`), or `&as=<username>` to start signed in.
-Compola's own palette (Zalo blue, light + dark); preview images are on Mobbin.
+Preview images are on Mobbin.
+
+**Style (2026-11 redesign): a dense enterprise ops console.** The admin console no longer follows the Zalo PC look of
+the desktop app. It keeps the Zalo-blue accent for primary actions, focus and the active nav item, on a neutral grey
+scale: 13px type, 32px controls, hairline borders instead of shadows, tables first. Themes are light and dark: the
+console follows the OS unless the user picks one in the user menu → *Giao diện* (saved per browser,
+`<html data-theme>`). The building blocks are `DataTable` (`admin/src/table.tsx`), `FilterChip`, `Popover` and
+`DescriptionList` (`admin/src/ui.tsx`), and the ⌘K palette (`admin/src/command.tsx`).
+
+| Where | App · screen | Link | What we borrowed |
+|---|---|---|---|
+| Shell (sidebar, breadcrumbs, settings) | Mintlify · Admin settings | [mobbin](https://mobbin.com/screens/b2eb011c-8166-4ea1-bbf0-6c31ec4dabe3) | Compact labelled nav sections, a **breadcrumb top bar** with search, and settings as **two-column sections** (what it is on the left, controls on the right). |
+| Tổng quan | Okta · Dashboard | [mobbin](https://mobbin.com/screens/72c7a956-c9ec-45ef-872e-c3ec74d672df) | Overview / Status / Org changes panels: a **status strip**, four **KPI tiles** that link to details (including failed sign-ins in the last 24 hours), server info as a key/value list, an endpoints table, and recent activity as a table. |
+| Sidebar footer | Twingate · Overview | [mobbin](https://mobbin.com/screens/32b62405-88c7-451d-9cab-637b12682553) | "All systems operational" status line: `● Đang hoạt động · v0.1.0`. |
+| Tables (users, permissions) | Snowflake · Users & roles | [mobbin](https://mobbin.com/screens/f47ed82d-47bd-45d3-b0a2-ecf5a8ab2e50) | Uppercase compact headers, **sortable columns**, a toolbar inside the table frame with search, filters and a count on the right. |
+| Nhật ký | Vanta · Event log | [mobbin](https://mobbin.com/screens/41659ab7-5710-4abf-91ca-c6bf482c9b0b) | **Filter chips** (Thời gian ▾, Người thực hiện ▾, Hành động ▾), a Time / Actor / Action / Details / IP table, and **Xuất CSV**. Rows still read as sentences and expand to JSON. |
+| Nhật ký (actor column) | 1Password · Activity log | [mobbin](https://mobbin.com/screens/4df9de3d-fe83-46ba-b832-33c3ffbc48df) | Full date-time column and an actor cell with avatar + @username. |
+
+Earlier references (layouts that are still in use):
 
 | Where | App · screen | Link | What we borrowed |
 |---|---|---|---|

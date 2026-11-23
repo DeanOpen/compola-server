@@ -1,8 +1,14 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   Activity,
   BarChart3,
+  ChevronDown,
+  ChevronRight,
   CircleUser,
+  Monitor,
+  Moon,
+  Search,
+  Sun,
   KeyRound,
   LayoutDashboard,
   LogOut,
@@ -17,11 +23,13 @@ import {
   X,
 } from 'lucide-react';
 import { api, ApiError, isMock, setUnauthorizedHandler } from './api';
-import { roleLabel } from './format';
+import { roleLabel, serverHealth } from './format';
+import { CommandPalette, isMac, useCommandShortcut, type Command } from './command';
+import { useInterval, useLoad } from './hooks';
 import { navigate, useRoute, type Route } from './router';
-import { toastError, useStore } from './store';
+import { toastError, useStore, type Theme } from './store';
 import type { Me } from './types';
-import { Avatar, Badge, Button, ConfirmHost, cx, Empty, ErrorBox, Spinner, Toasts } from './ui';
+import { Avatar, Badge, ConfirmHost, cx, Empty, ErrorBox, Kbd, MenuButtons, Popover, Segmented, Spinner, StatusDot, Toasts } from './ui';
 import { SignInPage } from './pages/SignIn';
 import { DevicePage } from './pages/Device';
 import { MePage } from './pages/Me';
@@ -47,41 +55,40 @@ interface NavItem {
 
 // Settings-style navigation with labelled sections (Base44 "Members and groups").
 const NAV_SECTIONS: { label: string | null; items: NavItem[] }[] = [
-  { label: null, items: [{ path: '/', label: 'Tổng quan', icon: <LayoutDashboard size={18} />, render: () => <DashboardPage /> }] },
+  { label: null, items: [{ path: '/', label: 'Tổng quan', icon: <LayoutDashboard size={16} />, render: () => <DashboardPage /> }] },
   {
     label: 'Truy cập & danh tính',
     items: [
-      { path: '/users', also: ['/groups'], label: 'Người dùng & nhóm', icon: <Users size={18} />, render: () => <MembersPage /> },
-      { path: '/grants', label: 'Phân quyền', icon: <ShieldCheck size={18} />, render: () => <GrantsPage /> },
-      { path: '/providers', label: 'Đăng nhập', icon: <KeyRound size={18} />, render: () => <ProvidersPage /> },
+      { path: '/users', also: ['/groups'], label: 'Người dùng & nhóm', icon: <Users size={16} />, render: () => <MembersPage /> },
+      { path: '/grants', label: 'Phân quyền', icon: <ShieldCheck size={16} />, render: () => <GrantsPage /> },
+      { path: '/providers', label: 'Đăng nhập', icon: <KeyRound size={16} />, render: () => <ProvidersPage /> },
     ],
   },
   {
     label: 'Giám sát',
     items: [
-      { path: '/activity', label: 'Hoạt động', icon: <Activity size={18} />, render: () => <ActivityPage /> },
-      { path: '/stats', label: 'Thống kê', icon: <BarChart3 size={18} />, render: () => <StatsPage /> },
+      { path: '/activity', label: 'Hoạt động', icon: <Activity size={16} />, render: () => <ActivityPage /> },
+      { path: '/stats', label: 'Thống kê', icon: <BarChart3 size={16} />, render: () => <StatsPage /> },
     ],
   },
   {
     label: 'Bảo mật',
     items: [
-      { path: '/sessions', label: 'Thiết bị', icon: <MonitorSmartphone size={18} />, render: () => <SessionsPage /> },
-      { path: '/audit', label: 'Nhật ký quản trị', icon: <ScrollText size={18} />, render: () => <AuditPage /> },
+      { path: '/sessions', label: 'Thiết bị', icon: <MonitorSmartphone size={16} />, render: () => <SessionsPage /> },
+      { path: '/audit', label: 'Nhật ký quản trị', icon: <ScrollText size={16} />, render: () => <AuditPage /> },
     ],
   },
   {
     label: 'Máy chủ',
     items: [
-      { path: '/zalo', label: 'Tài khoản Zalo', icon: <MessageCircle size={18} />, render: () => <ZaloPage /> },
-      { path: '/settings', label: 'Cài đặt máy chủ', icon: <Settings size={18} />, render: () => <SettingsPage /> },
+      { path: '/zalo', label: 'Tài khoản Zalo', icon: <MessageCircle size={16} />, render: () => <ZaloPage /> },
+      { path: '/settings', label: 'Cài đặt máy chủ', icon: <Settings size={16} />, render: () => <SettingsPage /> },
     ],
   },
 ];
-const ADMIN_NAV: NavItem[] = NAV_SECTIONS.flatMap((s) => s.items);
 const matches = (n: NavItem, path: string) => n.path === path || !!n.also?.includes(path);
 
-const ME_NAV: NavItem = { path: '/me', label: 'Tài khoản của tôi', icon: <CircleUser size={18} />, render: () => <MePage /> };
+const ME_NAV: NavItem = { path: '/me', label: 'Tài khoản của tôi', icon: <CircleUser size={16} />, render: () => <MePage /> };
 
 export function App() {
   const auth = useStore((s) => s.auth);
@@ -149,23 +156,33 @@ export function App() {
 function SignedIn({ me, route }: { me: Me; route: Route }) {
   const isAdmin = me.user.isAdmin;
   const [menuOpen, setMenuOpen] = useState(false);
+  const [cmdOpen, setCmdOpen] = useState(false);
   useEffect(() => setMenuOpen(false), [route.path]);
+  useCommandShortcut(() => setCmdOpen((v) => !v));
+  // Server name / health for the sidebar block and footer (admins only: the endpoint is admin-only).
+  const server = useLoad(() => (isAdmin ? api.server() : Promise.resolve(null)), [isAdmin]);
+  useInterval(() => isAdmin && void server.reload(), 30000);
 
   let page: ReactNode;
   let title = 'Compola Server';
+  let crumbs: string[] = [];
   if (route.path === '/device') {
     page = <DevicePage route={route} me={me} />;
     title = 'Đăng nhập thiết bị';
+    crumbs = [title];
   } else if (route.path === '/me') {
     page = <MePage />;
     title = ME_NAV.label;
+    crumbs = ['Cá nhân', title];
   } else if (!isAdmin) {
     page = route.path === '/' && me.access.role ? <MePage /> : <NoAdmin me={me} />;
   } else {
-    const item = ADMIN_NAV.find((n) => matches(n, route.path));
+    const sec = NAV_SECTIONS.find((s) => s.items.some((n) => matches(n, route.path)));
+    const item = sec?.items.find((n) => matches(n, route.path));
     if (item) {
       page = item.render();
       title = item.label;
+      crumbs = sec?.label ? [sec.label, item.label] : [item.label];
     } else {
       page = (
         <Empty title="Không tìm thấy trang">
@@ -179,6 +196,20 @@ function SignedIn({ me, route }: { me: Me; route: Route }) {
     document.title = `${title} · Compola Server`;
   }, [title]);
 
+  const commands = useMemo<Command[]>(
+    () => [
+      ...(isAdmin
+        ? NAV_SECTIONS.flatMap((s) =>
+            s.items.map((n) => ({ id: `page:${n.path}`, label: n.label, group: 'Trang', hint: s.label ?? undefined, icon: n.icon, run: () => navigate(n.path) })),
+          )
+        : []),
+      { id: 'page:/me', label: ME_NAV.label, group: 'Trang', hint: 'Cá nhân', icon: ME_NAV.icon, run: () => navigate('/me') },
+    ],
+    [isAdmin],
+  );
+
+  const s = server.data;
+  const health = s ? serverHealth(s) : null;
   const showSidebar = isAdmin;
   return (
     <div className={cx('shell', showSidebar && 'has-sidebar')}>
@@ -187,12 +218,14 @@ function SignedIn({ me, route }: { me: Me; route: Route }) {
           <aside className={cx('sidebar', menuOpen && 'is-open')}>
             <div className="sidebar-brand">
               <span className="brand-mark">C</span>
-              <span>
-                <strong>Compola</strong>
-                <span className="secondary"> Server</span>
+              <span className="sidebar-brand-text">
+                <strong>Compola Server</strong>
+                <span className="truncate" title={s?.name}>
+                  {s?.name ?? 'Bảng quản trị'}
+                </span>
               </span>
               <button type="button" className="sidebar-close btn btn-ghost btn-icon btn-sm" aria-label="Đóng menu" onClick={() => setMenuOpen(false)}>
-                <X size={18} />
+                <X size={16} />
               </button>
             </div>
             <nav className="nav">
@@ -200,7 +233,7 @@ function SignedIn({ me, route }: { me: Me; route: Route }) {
                 <div key={sec.label ?? 'main'} className="nav-section">
                   {sec.label && <div className="nav-section-label">{sec.label}</div>}
                   {sec.items.map((n) => (
-                    <a key={n.path} href={`#${n.path}`} className={cx('nav-item', matches(n, route.path) && 'is-active')}>
+                    <a key={n.path} href={`#${n.path}`} className={cx('nav-item', matches(n, route.path) && 'is-active')} aria-current={matches(n, route.path) ? 'page' : undefined}>
                       {n.icon}
                       <span>{n.label}</span>
                     </a>
@@ -215,29 +248,43 @@ function SignedIn({ me, route }: { me: Me; route: Route }) {
                 </a>
               </div>
             </nav>
+            {/* Twingate-style status line: is the server's Zalo session usable right now? */}
+            <a className="sidebar-foot" href="#/" title={health?.label}>
+              <StatusDot tone={health?.tone ?? 'neutral'} />
+              <span className="truncate">{health?.label ?? 'Đang kiểm tra…'}</span>
+              {s && <span className="tertiary nums">v{s.version}</span>}
+            </a>
           </aside>
           {menuOpen && <div className="sidebar-scrim" onClick={() => setMenuOpen(false)} />}
         </>
       )}
       <div className="main">
-        <TopBar me={me} onMenu={showSidebar ? () => setMenuOpen(true) : undefined} />
+        <TopBar me={me} crumbs={crumbs} onMenu={showSidebar ? () => setMenuOpen(true) : undefined} onSearch={() => setCmdOpen(true)} />
         <main className="content">{page}</main>
       </div>
+      {cmdOpen && <CommandPalette pages={commands} isAdmin={isAdmin} onClose={() => setCmdOpen(false)} />}
     </div>
   );
 }
 
-function TopBar({ me, onMenu }: { me: Me; onMenu?: () => void }) {
+const THEME_OPTIONS: { value: Theme; label: ReactNode }[] = [
+  { value: 'system', label: <Monitor size={14} aria-label="Hệ thống" /> },
+  { value: 'light', label: <Sun size={14} aria-label="Sáng" /> },
+  { value: 'dark', label: <Moon size={14} aria-label="Tối" /> },
+];
+
+function TopBar({ me, crumbs, onMenu, onSearch }: { me: Me; crumbs: string[]; onMenu?: () => void; onSearch: () => void }) {
   const setAuth = useStore((s) => s.setAuth);
-  const [busy, setBusy] = useState(false);
+  const theme = useStore((s) => s.theme);
+  const setTheme = useStore((s) => s.setTheme);
+  const [open, setOpen] = useState(false);
+  const btn = useRef<HTMLButtonElement>(null);
   const logout = async () => {
-    setBusy(true);
     try {
       await api.logout();
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 401)) {
         toastError(e);
-        setBusy(false);
         return;
       }
     }
@@ -249,25 +296,67 @@ function TopBar({ me, onMenu }: { me: Me; onMenu?: () => void }) {
     <header className="topbar">
       {onMenu ? (
         <button type="button" className="btn btn-ghost btn-icon menu-button" aria-label="Mở menu" onClick={onMenu}>
-          <Menu size={20} />
+          <Menu size={18} />
         </button>
       ) : (
         <a className="topbar-brand" href="#/">
           <span className="brand-mark">C</span>
-          <strong>Compola</strong>
+          <strong>Compola Server</strong>
         </a>
       )}
+      {crumbs.length > 0 && (
+        <nav className="crumbs" aria-label="Vị trí">
+          {onMenu && <span className="hide-sm">Quản trị</span>}
+          {crumbs.map((c, i) => (
+            <Fragment key={c}>
+              {(i > 0 || onMenu) && <ChevronRight size={14} className="hide-sm" />}
+              <span className={cx(i === crumbs.length - 1 ? 'crumb-current' : 'hide-sm', 'truncate')}>{c}</span>
+            </Fragment>
+          ))}
+        </nav>
+      )}
       <div className="topbar-spacer" />
-      <a className="topbar-user" href="#/me" title="Tài khoản của tôi">
-        <Avatar name={name} size={30} />
-        <span className="topbar-user-text">
-          <span className="truncate">{name}</span>
-          <span className="topbar-role">{roleLabel(me.user.isAdmin ? 'admin' : me.access.role)}</span>
-        </span>
-      </a>
-      <Button variant="ghost" icon={<LogOut size={16} />} busy={busy} onClick={logout} title="Đăng xuất">
-        <span className="hide-sm">Đăng xuất</span>
-      </Button>
+      <button type="button" className="cmdk-trigger hide-sm" onClick={onSearch}>
+        <Search size={14} />
+        <span>Tìm kiếm…</span>
+        <Kbd>{isMac ? '⌘K' : 'Ctrl K'}</Kbd>
+      </button>
+      <button type="button" className="btn btn-ghost btn-icon show-sm" aria-label="Tìm kiếm" onClick={onSearch}>
+        <Search size={17} />
+      </button>
+      <button
+        ref={btn}
+        type="button"
+        className={cx('user-trigger', open && 'is-open')}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={`Tài khoản: ${name}`}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <Avatar name={name} size={26} />
+        <ChevronDown size={14} />
+      </button>
+      <Popover anchor={btn} open={open} onClose={() => setOpen(false)} className="user-menu">
+        <div className="menu-head">
+          <Avatar name={name} size={34} />
+          <div className="cell-text">
+            <strong className="truncate">{name}</strong>
+            <span className="secondary small truncate">
+              @{me.user.username} · {roleLabel(me.user.isAdmin ? 'admin' : me.access.role)}
+            </span>
+          </div>
+        </div>
+        <MenuButtons
+          onDone={() => setOpen(false)}
+          items={[{ label: 'Tài khoản của tôi', icon: <CircleUser size={16} />, onSelect: () => navigate('/me') }]}
+        />
+        <div className="menu-label">Giao diện</div>
+        <div className="menu-block">
+          <Segmented value={theme} options={THEME_OPTIONS} onChange={setTheme} />
+        </div>
+        <div className="menu-sep" />
+        <MenuButtons onDone={() => setOpen(false)} items={[{ label: 'Đăng xuất', icon: <LogOut size={16} />, onSelect: () => void logout() }]} />
+      </Popover>
     </header>
   );
 }

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useRoute } from '../router';
+import { DataTable, type Column } from '../table';
 import { Eye, Globe2, MessagesSquare, Pencil, Plus, ShieldCheck, Tag, Trash2, User as UserIcon, Users as UsersIcon } from 'lucide-react';
 import { api } from '../api';
 import { effective, scopeCovers, whoSees } from '../access';
@@ -16,6 +17,7 @@ import {
   Empty,
   ErrorBox,
   Field,
+  FilterChip,
   FormModal,
   LabelChip,
   Loadable,
@@ -227,63 +229,58 @@ function GrantList({ grants, ctx, onEdit, onChanged, initialQuery = '' }: { gran
       </Empty>
     );
 
+  const columns: Column<Grant>[] = [
+    { key: 'subject', header: 'Đối tượng', render: (g) => <SubjectCell subject={g.subject} ctx={ctx} /> },
+    { key: 'role', header: 'Vai trò', width: 130, sort: (g) => g.role, render: (g) => <RoleBadge role={g.role} /> },
+    { key: 'scope', header: 'Phạm vi', className: 'col-scope', render: (g) => <ScopeCell scope={g.scope} ctx={ctx} /> },
+    {
+      key: 'note',
+      header: 'Ghi chú',
+      hideBelow: 1100,
+      render: (g) => (
+        <span className="secondary" title={`Tạo lúc ${formatDateTime(g.createdAt)}`}>
+          {g.note || <span className="tertiary">—</span>}
+        </span>
+      ),
+    },
+    {
+      key: 'actions',
+      header: '',
+      width: 48,
+      className: 'col-actions',
+      render: (g) => (
+        <RowMenu
+          items={[
+            { label: 'Sửa quyền', icon: <Pencil size={15} />, onSelect: () => onEdit(g) },
+            { label: 'Thu hồi quyền', icon: <Trash2 size={15} />, danger: true, onSelect: () => remove(g) },
+          ]}
+        />
+      ),
+    },
+  ];
+
   return (
-    <>
-      <div className="toolbar">
-        <SearchInput value={q} onChange={setQ} placeholder="Tìm theo người dùng, nhóm, ghi chú…" />
-        <select className="input input-auto" value={role} onChange={(e) => setRole(e.target.value as '' | Role)} aria-label="Vai trò">
-          <option value="">Mọi vai trò</option>
-          <option value="agent">Nhân viên</option>
-          <option value="viewer">Người xem</option>
-        </select>
-      </div>
-      <div className="table-wrap">
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Đối tượng</th>
-              <th>Vai trò</th>
-              <th>Phạm vi</th>
-              <th className="hide-md">Ghi chú</th>
-              <th className="col-actions" aria-label="Thao tác" />
-            </tr>
-          </thead>
-          <tbody>
-            {shown.map((g) => (
-              <tr key={g.id}>
-                <td>
-                  <SubjectCell subject={g.subject} ctx={ctx} />
-                </td>
-                <td>
-                  <RoleBadge role={g.role} />
-                </td>
-                <td className="col-scope">
-                  <ScopeCell scope={g.scope} ctx={ctx} />
-                </td>
-                <td className="hide-md secondary" title={`Tạo lúc ${formatDateTime(g.createdAt)}`}>
-                  {g.note || <span className="tertiary">—</span>}
-                </td>
-                <td className="col-actions">
-                  <RowMenu
-                    items={[
-                      { label: 'Sửa quyền', icon: <Pencil size={15} />, onSelect: () => onEdit(g) },
-                      { label: 'Thu hồi quyền', icon: <Trash2 size={15} />, danger: true, onSelect: () => remove(g) },
-                    ]}
-                  />
-                </td>
-              </tr>
-            ))}
-            {!shown.length && (
-              <tr>
-                <td colSpan={5} className="secondary center">
-                  Không có quyền nào khớp bộ lọc.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-    </>
+    <DataTable
+      rows={shown}
+      columns={columns}
+      rowKey={(g) => g.id}
+      toolbar={
+        <>
+          <SearchInput value={q} onChange={setQ} placeholder="Tìm theo người dùng, nhóm, ghi chú…" />
+          <FilterChip
+            label="Vai trò"
+            value={role || null}
+            options={[
+              { value: 'agent', label: 'Nhân viên' },
+              { value: 'viewer', label: 'Người xem' },
+            ]}
+            onChange={(v) => setRole((v ?? '') as '' | Role)}
+          />
+        </>
+      }
+      count={`${shown.length} quyền`}
+      empty={<span className="secondary">Không có quyền nào khớp bộ lọc.</span>}
+    />
   );
 }
 

@@ -18,18 +18,50 @@ interface ConfirmRequest {
   resolve: (ok: boolean) => void;
 }
 
+/** Colour theme: follow the OS, or force light / dark (user menu → Giao diện). Remembered per browser. */
+export type Theme = 'system' | 'light' | 'dark';
+const THEME_KEY = 'compola-admin-theme';
+
+export function readTheme(): Theme {
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    return v === 'light' || v === 'dark' ? v : 'system';
+  } catch {
+    return 'system';
+  }
+}
+
+export function applyTheme(theme: Theme) {
+  const root = document.documentElement;
+  if (theme === 'system') delete root.dataset.theme;
+  else root.dataset.theme = theme;
+}
+
 interface State {
   auth: AuthState;
   toasts: Toast[];
   confirm: ConfirmRequest | null;
+  theme: Theme;
   setAuth: (auth: AuthState) => void;
+  setTheme: (theme: Theme) => void;
 }
 
 export const useStore = create<State>((set) => ({
   auth: { status: 'loading' },
   toasts: [],
   confirm: null,
+  theme: readTheme(),
   setAuth: (auth) => set({ auth }),
+  setTheme: (theme) => {
+    try {
+      if (theme === 'system') localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      // Storage blocked (private window): the choice lasts for this page only.
+    }
+    applyTheme(theme);
+    set({ theme });
+  },
 }));
 
 let toastId = 0;
