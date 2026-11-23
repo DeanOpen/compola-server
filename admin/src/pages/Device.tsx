@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { CheckCircle2, MonitorSmartphone, XCircle } from 'lucide-react';
+import { ArrowLeftRight, CheckCircle2, MonitorSmartphone, XCircle } from 'lucide-react';
 import { api, ApiError } from '../api';
 import { formatDateTime, roleLabel, scopeSummary, shortId } from '../format';
 import { useLoad } from '../hooks';
@@ -92,8 +92,13 @@ function Approve({ code, me }: { code: string; me: Me }) {
 
   return (
     <div className="card card-body device-card">
-      <div className="device-icon">
-        <MonitorSmartphone size={30} />
+      {/* Two-logo header: this server ⇄ the device asking (incident.io "Sign in with Slack"). */}
+      <div className="link-logos" aria-hidden="true">
+        <span className="brand-mark brand-mark-lg">C</span>
+        <ArrowLeftRight size={18} className="tertiary" />
+        <span className="link-logo-device">
+          <MonitorSmartphone size={22} />
+        </span>
       </div>
       {info.loading && info.data === undefined && !info.error ? (
         <Spinner />
@@ -106,7 +111,7 @@ function Approve({ code, me }: { code: string; me: Me }) {
       ) : (
         <>
           <h2>Cho phép thiết bị này đăng nhập bằng tài khoản của bạn?</h2>
-          <div className="device-code nums">{code}</div>
+          <CodeBoxes code={code} />
           <p className="secondary">Chỉ cho phép khi mã này trùng với mã đang hiển thị trên thiết bị.</p>
           <div className="identity-block">
             <span className="identity-label">Thiết bị yêu cầu</span>
@@ -146,6 +151,24 @@ function Approve({ code, me }: { code: string; me: Me }) {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/** The user code as big segmented boxes: XXXX – XXXX. */
+function CodeBoxes({ code }: { code: string }) {
+  const [a, b] = code.includes('-') ? code.split('-') : [code.slice(0, 4), code.slice(4)];
+  const boxes = (part: string) =>
+    part.split('').map((ch, i) => (
+      <span key={i} className="code-box">
+        {ch}
+      </span>
+    ));
+  return (
+    <div className="code-boxes nums" aria-label={`Mã ${code}`}>
+      {boxes(a)}
+      <span className="code-dash">–</span>
+      {boxes(b ?? '')}
     </div>
   );
 }

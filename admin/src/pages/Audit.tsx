@@ -60,7 +60,7 @@ export function AuditPage() {
       return n;
     });
 
-  const filtered = !!(userId || action || ip.trim() || frame !== 'all');
+  const filtered = !!(userId || action || ip.trim());
 
   return (
     <div className="page">
@@ -112,7 +112,6 @@ export function AuditPage() {
               setUserId('');
               setAction('');
               setIp('');
-              setFrame('all');
             }}
           >
             Xóa bộ lọc

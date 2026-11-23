@@ -17,11 +17,11 @@ import {
   ErrorBox,
   Field,
   FormModal,
-  IconButton,
   LabelChip,
   Loadable,
   MultiPicker,
   PageHeader,
+  RowMenu,
   SearchInput,
   Segmented,
   SinglePicker,
@@ -264,8 +264,12 @@ function GrantList({ grants, ctx, onEdit, onChanged, initialQuery = '' }: { gran
                   {g.note || <span className="tertiary">—</span>}
                 </td>
                 <td className="col-actions">
-                  <IconButton label="Sửa" icon={<Pencil size={16} />} onClick={() => onEdit(g)} />
-                  <IconButton label="Thu hồi" variant="danger-ghost" icon={<Trash2 size={16} />} onClick={() => remove(g)} />
+                  <RowMenu
+                    items={[
+                      { label: 'Sửa quyền', icon: <Pencil size={15} />, onSelect: () => onEdit(g) },
+                      { label: 'Thu hồi quyền', icon: <Trash2 size={15} />, danger: true, onSelect: () => remove(g) },
+                    ]}
+                  />
                 </td>
               </tr>
             ))}

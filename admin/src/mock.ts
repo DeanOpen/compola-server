@@ -115,13 +115,13 @@ const providers: Provider[] = [
 ];
 
 const sessions: Session[] = [
-  { id: 's_1', user: { id: 'u_admin', username: 'admin', displayName: 'Nguyễn Quản Trị' }, kind: 'web', deviceId: '', deviceName: 'Trình duyệt', ip: '192.168.1.20', createdAt: now - 2 * hour, lastSeenAt: now - min, online: true, current: true },
+  { id: 's_1', user: { id: 'u_admin', username: 'admin', displayName: 'Nguyễn Quản Trị' }, kind: 'web', deviceId: '', deviceName: 'Chrome · macOS', ip: '192.168.1.20', createdAt: now - 2 * hour, lastSeenAt: now - min, online: true, current: true },
   { id: 's_2', user: { id: 'u_lan', username: 'lan', displayName: 'Trần Thị Lan' }, kind: 'device', deviceId: 'd7f3a91c-52be-4e0a-9c11-3b8f0e2d7a44', deviceName: 'MacBook Pro', ip: '192.168.1.31', createdAt: now - 6 * day, lastSeenAt: now - 30_000, online: true },
   { id: 's_6', user: { id: 'u_lan', username: 'lan', displayName: 'Trần Thị Lan' }, kind: 'device', deviceId: '0b42c8e7-19d3-4f6a-a2e5-77c1d9f04b18', deviceName: 'MacBook Pro', ip: '192.168.1.60', createdAt: now - 20 * day, lastSeenAt: now - 2 * day, online: false },
   { id: 's_3', user: { id: 'u_minh', username: 'minh', displayName: 'Lê Văn Minh' }, kind: 'device', deviceId: '5e19b0d2-8c4a-4b7e-b3f1-c2a8e6d91f07', deviceName: 'DESKTOP-MINH', ip: '10.8.0.12', createdAt: now - 9 * day, lastSeenAt: now - 20_000, online: true },
-  { id: 's_7', user: { id: 'u_minh', username: 'minh', displayName: 'Lê Văn Minh' }, kind: 'web', deviceId: '', deviceName: 'Trình duyệt', ip: '10.8.0.12', createdAt: now - 3 * hour, lastSeenAt: now - 3 * hour, online: false },
+  { id: 's_7', user: { id: 'u_minh', username: 'minh', displayName: 'Lê Văn Minh' }, kind: 'web', deviceId: '', deviceName: 'Edge · Windows', ip: '10.8.0.12', createdAt: now - 3 * hour, lastSeenAt: now - 3 * hour, online: false },
   { id: 's_4', user: { id: 'u_vy', username: 'vy.nguyen', displayName: 'Nguyễn Thảo Vy' }, kind: 'device', deviceId: 'a8c2f4e1-3d7b-4a9c-8e2f-1b5d7c9e3a60', deviceName: 'MacBook Pro', ip: '192.168.1.45', createdAt: now - 2 * day, lastSeenAt: now - 5 * hour, online: false },
-  { id: 's_5', user: { id: 'u_hoa', username: 'hoa.pham', displayName: 'Phạm Thu Hoa' }, kind: 'web', deviceId: '', deviceName: 'Trình duyệt', ip: '113.161.4.7', createdAt: now - 3 * day, lastSeenAt: now - 3 * day, online: false },
+  { id: 's_5', user: { id: 'u_hoa', username: 'hoa.pham', displayName: 'Phạm Thu Hoa' }, kind: 'web', deviceId: '', deviceName: 'Safari · iOS', ip: '113.161.4.7', createdAt: now - 3 * day, lastSeenAt: now - 3 * day, online: false },
 ];
 
 const audit: AuditEntry[] = [];
@@ -196,9 +196,10 @@ function log(action: string, target: string, detail: Record<string, unknown> | n
 }
 
 function meOf(u: User) {
-  if (u.isAdmin) return { user: u, access: { role: 'admin', scope: { all: true, conversations: [], labels: [] } } };
+  const session = sessions.find((x) => x.user?.id === u.id && x.kind === 'web') ?? null;
+  if (u.isAdmin) return { user: u, session, access: { role: 'admin', scope: { all: true, conversations: [], labels: [] } } };
   const eff = effective(u.id, grants, groups);
-  return { user: u, access: eff.role ? { role: eff.role, scope: eff.scope } : null };
+  return { user: u, session, access: eff.role ? { role: eff.role, scope: eff.scope } : null };
 }
 
 function publicProviders() {

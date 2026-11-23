@@ -281,6 +281,7 @@ export function ConfirmHost() {
         </>
       }
     >
+      {/* Destructive confirm: a plain question, what happens, a red primary (Replit "Sign out of all devices?"). */}
       {req.message && <p className="confirm-message">{req.message}</p>}
     </Modal>
   );
