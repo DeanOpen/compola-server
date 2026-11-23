@@ -388,7 +388,7 @@ impl Remote {
     }
 
     fn engine(&self) -> Option<Arc<crate::engine::Engine>> {
-        self.app.try_state::<Arc<crate::engine::Engine>>().map(|e| e.inner().clone())
+        crate::account::engine(&self.app, Some(crate::account::DEFAULT_ID)).ok()
     }
 
     fn phase_kind(&self) -> String {
