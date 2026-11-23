@@ -198,6 +198,8 @@ pub struct UserPatch {
 #[derive(Clone, Debug, Default)]
 pub struct NewActivity {
     pub account: String,
+    /// The Zalo uid of the account (stable across a remove and re-add; docs/multi-account.md §1).
+    pub account_uid: String,
     pub user: Option<(String, String, String)>, // id, username, display name
     pub device_id: String,
     pub device_name: String,
@@ -226,7 +228,7 @@ pub struct ActivityFilter {
     pub before: Option<i64>,
 }
 
-const ACTIVITY_COLS: &str = "id, at, account, user_id, username, display_name, device_id, device_name, device_kind, action, conversation_id, conversation_name, message_id, ok, response_ms, detail";
+const ACTIVITY_COLS: &str = "id, at, account, user_id, username, display_name, device_id, device_name, device_kind, action, conversation_id, conversation_name, message_id, ok, response_ms, detail, account_uid";
 const ACTIVITY_WHERE: &str = "(?1 IS NULL OR user_id = ?1) AND (?2 IS NULL OR account = ?2) AND (?3 IS NULL OR conversation_id = ?3)
   AND (?4 IS NULL OR action = ?4 OR action LIKE ?4 || '.%') AND (?5 IS NULL OR at >= ?5) AND (?6 IS NULL OR at < ?6)";
 
@@ -246,6 +248,7 @@ fn activity_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "ok": r.get::<_, bool>(13)?,
         "responseMs": r.get::<_, Option<i64>>(14)?,
         "detail": serde_json::from_str::<Value>(&detail).unwrap_or(Value::Null),
+        "accountUid": r.get::<_, String>(16)?,
     }))
 }
 
@@ -346,7 +349,7 @@ CREATE TABLE IF NOT EXISTS activity(
   user_id TEXT, username TEXT, display_name TEXT,
   device_id TEXT NOT NULL DEFAULT '', device_name TEXT NOT NULL DEFAULT '', device_kind TEXT NOT NULL DEFAULT 'device',
   action TEXT NOT NULL, conversation_id TEXT, conversation_name TEXT, message_id TEXT,
-  ok INTEGER NOT NULL DEFAULT 1, response_ms INTEGER, detail TEXT NOT NULL DEFAULT '{}');
+  ok INTEGER NOT NULL DEFAULT 1, response_ms INTEGER, detail TEXT NOT NULL DEFAULT '{}', account_uid TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS activity_at ON activity(at);
 CREATE INDEX IF NOT EXISTS activity_user ON activity(user_id, at);
 CREATE INDEX IF NOT EXISTS activity_conv ON activity(conversation_id, at);
@@ -978,10 +981,10 @@ impl Store {
         let c = self.conn.lock();
         let (user_id, username, display) = a.user.map(|(i, u, d)| (Some(i), Some(u), Some(d))).unwrap_or((None, None, None));
         let r = c.execute(
-            &format!("INSERT INTO activity({}) VALUES(NULL,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)", ACTIVITY_COLS),
+            &format!("INSERT INTO activity({}) VALUES(NULL,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", ACTIVITY_COLS),
             params![
                 now_ms(), a.account, user_id, username, display, a.device_id, a.device_name, a.device_kind, a.action,
-                a.conversation_id, a.conversation_name, a.message_id, a.ok, a.response_ms, a.detail.to_string()
+                a.conversation_id, a.conversation_name, a.message_id, a.ok, a.response_ms, a.detail.to_string(), a.account_uid
             ],
         );
         if let Err(e) = r {
