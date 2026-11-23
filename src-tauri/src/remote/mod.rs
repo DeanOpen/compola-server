@@ -218,15 +218,14 @@ pub struct Remote {
     /// Accounts and sign-in of the host (None when the database cannot be opened).
     auth: Option<Arc<auth::Auth>>,
     /// What the host's renderer posted, for the policy and the admin console's conversation picker.
-    mirror: RwLock<policy::Mirror>,
+    /// Per Zalo account (conversation ids are only unique within an account, docs/multi-account.md §7).
+    mirrors: RwLock<std::collections::HashMap<String, policy::Mirror>>,
     /// Cancels a browser sign-in under way (`remote_join_cancel`).
     join_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// The listener runs: the mirror follows the renderer's state.
     serving: std::sync::atomic::AtomicBool,
     /// The host app's own sign-in to its server (the owner), for the native admin screens (`remote_api`).
     owner_token: Mutex<Option<String>>,
-    /// The signed-in Zalo uid of the host (from the renderer's profile), recorded with activity.
-    account_uid: Mutex<String>,
 }
 
 /// Who performed an action (activity tracking): a server user on a device / the web, or the host app itself.
@@ -274,11 +273,10 @@ impl Remote {
             server_error: Mutex::new(None),
             client,
             auth,
-            mirror: RwLock::new(policy::Mirror::default()),
+            mirrors: RwLock::new(std::collections::HashMap::new()),
             join_cancel: Mutex::new(None),
             serving: std::sync::atomic::AtomicBool::new(false),
             owner_token: Mutex::new(None),
-            account_uid: Mutex::new(String::new()),
         })
     }
 
@@ -350,6 +348,7 @@ impl Remote {
         let mut slot = self.server.lock().await;
         *slot = None;
         self.serving.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::account::set_server_multi_account(false);
         self.hub.kick_all("restarted");
         *self.server_error.lock() = None;
         if config.enabled && self.client.is_none() {
@@ -358,12 +357,18 @@ impl Remote {
             } else {
                 match server::start(Arc::downgrade(self), config.port, config.allow_network).await {
                     Ok(handle) => {
-                        // What the renderer posted before the server started.
-                        let mut mirror = policy::Mirror::default();
-                        for event in self.engine().map(|e| e.replay()).unwrap_or_default() {
-                            mirror.observe(&event);
+                        // What each account's renderer posted before the server started.
+                        let mut mirrors = std::collections::HashMap::new();
+                        for id in self.account_ids() {
+                            let mut mirror = policy::Mirror::default();
+                            for event in crate::account::engine(&self.app, Some(&id)).map(|e| e.replay()).unwrap_or_default() {
+                                mirror.observe(&event);
+                            }
+                            mirrors.insert(id, mirror);
                         }
-                        *self.mirror.write() = mirror;
+                        *self.mirrors.write() = mirrors;
+                        // The mirror and policy are per account: every account reaches the server, tagged (§7).
+                        crate::account::set_server_multi_account(true);
                         self.serving.store(true, std::sync::atomic::Ordering::Relaxed);
                         *slot = Some(handle);
                     }
@@ -403,7 +408,7 @@ impl Remote {
         let Some(auth) = self.auth() else { return };
         self.hub.refresh_access(
             |user_id| auth.store.user(user_id).ok().and_then(|u| auth.store.access_of(&u).ok()).and_then(|(a, _)| a),
-            |access| self.mirror.read().conversations_snapshot(access),
+            |access| self.access_messages(access),
         );
         self.changed();
     }
@@ -512,6 +517,88 @@ impl Remote {
         Ok(())
     }
 
+    // ---- accounts (docs/compola-server.md, "Multiple Zalo accounts") ----
+
+    /// The host's accounts, in switcher order (`default` alone on a single-account host).
+    fn account_list(&self) -> Option<crate::account::AccountList> {
+        crate::account::list(&self.app)
+    }
+
+    fn account_ids(&self) -> Vec<String> {
+        match self.account_list() {
+            Some(l) if !l.accounts.is_empty() => {
+                let mut list = l.accounts;
+                list.sort_by_key(|a| a.order);
+                list.into_iter().map(|a| a.id).collect()
+            }
+            _ => vec![crate::account::DEFAULT_ID.to_owned()],
+        }
+    }
+
+    /// `{<id>: name}` of the host's accounts (the label when set, else the Zalo name).
+    fn account_names(&self) -> serde_json::Map<String, Value> {
+        self.account_list()
+            .map(|l| l.accounts.into_iter().map(|a| (a.id, json!(a.label.or(a.name).unwrap_or_default()))).collect())
+            .unwrap_or_default()
+    }
+
+    fn account_uid(&self, account: &str) -> String {
+        self.account_list().and_then(|l| l.accounts.into_iter().find(|a| a.id == account)).and_then(|a| a.uid).unwrap_or_default()
+    }
+
+    /// The accounts a user may see (`hello.accounts`, `{t: "accounts"}`): `{active, maxAccounts, accounts}`, `active`
+    /// being the first one.
+    fn accounts_for(&self, access: &store::UserAccess) -> Value {
+        let Some(list) = self.account_list() else {
+            return json!({ "active": crate::account::DEFAULT_ID, "maxAccounts": 1, "accounts": [] });
+        };
+        let mut visible: Vec<_> = list.accounts.into_iter().filter(|a| access.for_account(&a.id).is_some()).collect();
+        visible.sort_by_key(|a| a.order);
+        let first = visible.first().map(|a| a.id.clone()).unwrap_or_else(|| crate::account::DEFAULT_ID.to_owned());
+        json!({ "active": first, "maxAccounts": list.max_accounts, "accounts": visible })
+    }
+
+    /// The account an invoke targets: `args.account` when the user may use it, else their first account.
+    fn account_for_invoke(&self, access: &store::UserAccess, requested: Option<&str>) -> Result<String, String> {
+        if let Some(id) = requested.filter(|a| !a.is_empty()) {
+            if !crate::account::valid_id(id) {
+                return Err("Tài khoản không tồn tại".into());
+            }
+            return if access.for_account(id).is_some() { Ok(id.to_owned()) } else { Err("Bạn không có quyền với tài khoản Zalo này.".into()) };
+        }
+        self.account_ids().into_iter().find(|id| access.for_account(id).is_some()).ok_or_else(|| "Bạn không có quyền với tài khoản Zalo nào.".into())
+    }
+
+    /// Reads an account's mirror (an empty one when the account has posted nothing yet).
+    fn with_mirror<R>(&self, account: &str, f: impl FnOnce(&policy::Mirror) -> R) -> R {
+        let mirrors = self.mirrors.read();
+        match mirrors.get(account) {
+            Some(m) => f(m),
+            None => f(&policy::Mirror::default()),
+        }
+    }
+
+    fn with_mirror_mut<R>(&self, account: &str, f: impl FnOnce(&mut policy::Mirror) -> R) -> R {
+        f(self.mirrors.write().entry(account.to_owned()).or_default())
+    }
+
+    /// What a connected user is sent when their access changed: the new access and account list, then each
+    /// account's conversation list again (conversations that left the scope disappear).
+    fn access_messages(&self, access: &store::UserAccess) -> Vec<String> {
+        let ids = self.account_ids();
+        let mut out = vec![json!({ "t": "access", "access": access.expanded(&ids), "accounts": self.accounts_for(access) }).to_string()];
+        for id in &ids {
+            if let Some(a) = access.for_account(id) {
+                if let Some(snapshot) = self.with_mirror(id, |m| m.conversations_snapshot(&a)) {
+                    let mut payload = snapshot;
+                    payload["account"] = json!(id);
+                    out.push(json!({ "t": "event", "account": id, "event": "compola://state", "payload": payload }).to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// The admin the host app acts as: the one created in the app, else the oldest active admin.
     fn owner(&self, auth: &auth::Auth) -> Result<store::User, String> {
         let owner = self.config.lock().owner_user_id.clone();
@@ -525,12 +612,13 @@ impl Remote {
 
     /// Records one attributed action; a successful send also gets its response time (since the oldest unanswered
     /// inbound message of the conversation) and closes that wait.
-    fn record_activity(&self, actor: Actor, info: policy::CallInfo, call: &str, ok: bool) {
+    fn record_activity(&self, actor: Actor, account: &str, info: policy::CallInfo, call: &str, ok: bool) {
         let Some(auth) = self.auth() else { return };
         let now = store::now_ms();
         let sends = matches!(info.action, "message.send" | "message.media" | "message.file" | "message.sticker" | "message.card");
         let (response_ms, conversation_name) = {
-            let mut mirror = self.mirror.write();
+            let mut mirrors = self.mirrors.write();
+            let mirror = mirrors.entry(account.to_owned()).or_default();
             let name = info.conversation.as_deref().and_then(|c| mirror.conversation_name(c));
             let response = match (&info.conversation, ok && sends) {
                 (Some(c), true) => {
@@ -547,8 +635,8 @@ impl Remote {
             detail["conversations"] = json!(info.conversations);
         }
         auth.store.add_activity(store::NewActivity {
-            account: String::new(),
-            account_uid: self.account_uid.lock().clone(),
+            account: account.to_owned(),
+            account_uid: self.account_uid(account),
             user: actor.user,
             device_id: actor.device_id,
             device_name: actor.device_name,
@@ -591,16 +679,15 @@ pub fn forward_event<S: Serialize>(app: &AppHandle, event: &str, payload: &S) {
         return;
     }
     let Ok(value) = serde_json::to_value(payload) else { return };
+    // Tagged with its account when multi-account forwarding is on (§7); else the default account's.
+    let account = value.get("account").and_then(Value::as_str).unwrap_or(crate::account::DEFAULT_ID).to_owned();
     if event == "compola://state" {
-        if let Some(uid) = value.pointer("/user/userId").and_then(Value::as_str).filter(|u| !u.is_empty()) {
-            let mut current = remote.account_uid.lock();
-            if *current != uid {
-                *current = uid.to_owned();
-            }
+        remote.with_mirror_mut(&account, |m| m.observe(&value));
+    } else if event == "compola://page" {
+        let page = value.get("page").unwrap_or(&value);
+        if matches!(page.as_str(), Some("main" | "Main")) {
+            remote.with_mirror_mut(&account, |m| m.reset());
         }
-        remote.mirror.write().observe(&value);
-    } else if event == "compola://page" && matches!(value.as_str(), Some("main" | "Main")) {
-        remote.mirror.write().reset();
     }
     if remote.hub.has_clients() {
         remote.hub.publish(event, value);
@@ -608,26 +695,35 @@ pub fn forward_event<S: Serialize>(app: &AppHandle, event: &str, payload: &S) {
 }
 
 /// The host app's own adapter calls (its UI, not a joined user): recorded as `host` activity while the server runs.
-pub fn record_local_call(app: &AppHandle, cmd: &str, target: &str, method: &str, args: &[Value], ok: bool) {
+pub fn record_local_call(app: &AppHandle, account: Option<&str>, cmd: &str, target: &str, method: &str, args: &[Value], ok: bool) {
     let Some(remote) = app.try_state::<Arc<Remote>>() else { return };
     if remote.client.is_some() || !remote.serving.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let account = match account {
+        Some(a) => a.to_owned(),
+        None => crate::account::accounts(app).active_id(),
+    };
     let call_args = json!({ "target": target, "method": method, "args": args });
-    let Some(info) = policy::describe_call(&remote.mirror.read(), cmd, &call_args) else { return };
+    let Some(info) = remote.with_mirror(&account, |m| policy::describe_call(m, cmd, &call_args)) else { return };
     let actor = Actor { user: None, device_id: String::new(), device_name: computer_name(), device_kind: "host".into() };
-    remote.record_activity(actor, info, &format!("{target}.{method}"), ok);
+    remote.record_activity(actor, &account, info, &format!("{target}.{method}"), ok);
 }
 
 /// `$znoti.createNotification` hook: joined users who may see the conversation get it too.
-pub fn forward_notification(app: &AppHandle, title: &str, body: &str, tag: &str, silent: bool, image: Option<&[u8]>) {
+/// `account`: `Some` adds `"account"` to the payload (multi-account forwarding on, docs/multi-account.md §7).
+pub fn forward_notification(app: &AppHandle, account: Option<&str>, title: &str, body: &str, tag: &str, silent: bool, image: Option<&[u8]>) {
     let Some(remote) = app.try_state::<Arc<Remote>>() else { return };
     if !remote.hub.has_clients() {
         return;
     }
     use base64::Engine as _;
     let image = image.filter(|d| d.len() <= MAX_NOTIFICATION_IMAGE).map(|d| base64::engine::general_purpose::STANDARD.encode(d));
-    remote.hub.publish(NOTIFICATION_EVENT, json!({ "title": title, "body": body, "tag": tag, "silent": silent, "image": image }));
+    let mut payload = json!({ "title": title, "body": body, "tag": tag, "silent": silent, "image": image });
+    if let Some(a) = account {
+        payload["account"] = json!(a);
+    }
+    remote.hub.publish(NOTIFICATION_EVENT, payload);
 }
 
 // ---- commands: host ----
@@ -876,6 +972,24 @@ pub async fn remote_leave(app: AppHandle, remote: RemoteState<'_>) -> Result<(),
     }
     remote.update_config(|c| c.join = None)?;
     app.restart();
+}
+
+/// `accounts_list` of a joined app (the server's accounts the user may use).
+#[tauri::command]
+pub fn remote_accounts_list(remote: RemoteState<'_>) -> Result<Value, String> {
+    Ok(remote.client.as_ref().ok_or("not joined")?.accounts_list())
+}
+
+/// `account_set_active` of a joined app: which of the server's accounts this app shows (local).
+#[tauri::command]
+pub fn remote_account_set_active(remote: RemoteState<'_>, account: String) -> Result<(), String> {
+    remote.client.as_ref().ok_or("not joined")?.set_active_account(&account)
+}
+
+/// `ui_set_event_scope` of a joined app.
+#[tauri::command]
+pub fn remote_set_event_scope(remote: RemoteState<'_>, scope: String) -> Result<(), String> {
+    remote.client.as_ref().ok_or("not joined")?.set_event_scope(&scope)
 }
 
 /// Reconnect now instead of waiting for the next attempt.

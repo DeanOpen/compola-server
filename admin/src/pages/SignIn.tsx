@@ -6,7 +6,7 @@ import { ArrowLeft, Fingerprint, KeyRound, MonitorSmartphone, Server } from 'luc
 import { api, isMock } from '../api';
 import { useLoad } from '../hooks';
 import { navigate, nextFrom, type Route } from '../router';
-import { Button, cx, ErrorBox, Field, Spinner } from '../ui';
+import { BrandMark, Button, cx, ErrorBox, Field, Spinner } from '../ui';
 
 /** Reads an error the server put in the URL after a failed SSO round trip (`?error=` or `#/login?error=`). */
 function urlError(route: Route): string | null {
@@ -110,7 +110,7 @@ export function SignInPage({ route, signedIn, onSignedIn }: { route: Route; sign
     <div className="center-screen signin-screen">
       <div className="signin">
         <div className="signin-brand">
-          <span className="brand-mark brand-mark-lg">C</span>
+          <BrandMark large />
           <h1>Đăng nhập vào {p?.serverName || 'Compola Server'}</h1>
           <p className="secondary">Máy chủ Compola dùng chung tài khoản Zalo của nhóm bạn</p>
         </div>

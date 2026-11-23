@@ -1,10 +1,11 @@
 import { AlertTriangle, ArrowRight, Copy, Info, KeyRound, MonitorSmartphone, Server, Settings, ShieldAlert, Users } from 'lucide-react';
 import { api } from '../api';
-import { actionLabel, actionTone, formatDateTime, formatRelative, PHASE_LABEL, phaseTone, serverHealth, toDate } from '../format';
+import { actionLabel, actionTone, formatDateTime, formatRelative, PHASE_LABEL, serverHealth, toDate } from '../format';
 import { useInterval, useLoad } from '../hooks';
 import { toast } from '../store';
 import { DataTable } from '../table';
-import type { Address, Session } from '../types';
+import type { Address, Session, ZaloAccounts } from '../types';
+import { accountName, phaseKind } from '../access';
 import { AuditSentence } from '../auditView';
 import { Avatar, Badge, Card, DescriptionList, Empty, IconButton, Loadable, OnlineDot, PageHeader, Person, Stat, StatusDot } from '../ui';
 
@@ -47,10 +48,12 @@ export function DashboardPage() {
   const sessions = useLoad(() => api.sessions(), []);
   // Enough history for the 24h failed sign-in count; the table shows the newest rows.
   const audit = useLoad(() => api.audit({ limit: 100 }), []);
+  const zaloAccounts = useLoad(() => api.accounts().catch(() => null), []);
   useInterval(() => {
     void sessions.reload();
     void audit.reload();
     void server.reload();
+    void zaloAccounts.reload();
   }, 20000);
 
   const online = sessions.data?.filter((s) => s.online) ?? [];
@@ -146,53 +149,10 @@ export function DashboardPage() {
                 />
               </div>
               <div className="overview-grid">
-                <Card title="Tài khoản Zalo" actions={<a className="link small" href="#/zalo">Quản lý</a>}>
-                  {s.account ? (
-                    <div className="stack">
-                      <div className="account-panel">
-                        <Avatar name={s.account.name || 'Zalo'} src={s.account.avatar} size={44} />
-                        <div className="profile-text">
-                          <h2>{s.account.name || 'Chưa có tên'}</h2>
-                          <Badge tone={phaseTone(s.account.phase)} dot>
-                            {PHASE_LABEL[s.account.phase] ?? s.account.phase}
-                          </Badge>
-                        </div>
-                      </div>
-                      {phaseTone(s.account.phase) !== 'ok' && (
-                        <div className="account-hint">
-                          <Info size={15} />
-                          <span>
-                            Người dùng Compola Server chưa dùng được tài khoản cho tới khi máy chủ đăng nhập Zalo.{' '}
-                            <a className="link" href="#/zalo">
-                              {s.account.phase === 'login' ? 'Đăng nhập bằng mã QR' : 'Xem trạng thái'}
-                            </a>
-                          </span>
-                        </div>
-                      )}
-                      <DescriptionList
-                        items={[
-                          { label: 'Đang sử dụng', value: sessions.data ? `${onlineByPerson.length} người · ${online.length} thiết bị` : '—' },
-                          {
-                            label: 'Quyền truy cập',
-                            value: (
-                              <a className="link" href="#/grants">
-                                Xem phân quyền <ArrowRight size={13} className="inline-icon" />
-                              </a>
-                            ),
-                          },
-                          { label: 'Hoạt động', value: <a className="link" href="#/activity">Thao tác trên Zalo <ArrowRight size={13} className="inline-icon" /></a> },
-                        ]}
-                      />
-                    </div>
-                  ) : (
-                    <p className="secondary">
-                      Máy chủ chưa đăng nhập tài khoản Zalo.{' '}
-                      <a className="link" href="#/zalo">
-                        Đăng nhập bằng mã QR
-                      </a>
-                    </p>
-                  )}
-                </Card>
+                <ZaloAccountsCard
+                  accounts={zaloAccounts.data}
+                  usage={sessions.data ? `${onlineByPerson.length} người · ${online.length} thiết bị` : '—'}
+                />
                 <Card title="Máy chủ" actions={<a className="link small" href="#/settings">Cài đặt</a>} pad={false}>
                   <div className="card-body">
                     <DescriptionList
@@ -303,4 +263,82 @@ function CopyButton({ value }: { value: string }) {
     }
   };
   return <IconButton label="Sao chép" icon={<Copy size={14} />} onClick={copy} />;
+}
+
+/** Accounts summary (M5): "2 / 3 đã đăng nhập", each account with its phase and unread count. */
+function ZaloAccountsCard({ accounts, usage }: { accounts: ZaloAccounts | null | undefined; usage: string }) {
+  const list = accounts?.accounts ?? [];
+  const ready = list.filter((a) => a.enabled && phaseKind(a.phase) === 'ready').length;
+  const waiting = list.filter((a) => a.enabled && phaseKind(a.phase) !== 'ready');
+  return (
+    <Card title="Tài khoản Zalo" actions={<a className="link small" href="#/zalo">Quản lý</a>}>
+      {accounts === undefined ? (
+        <span className="secondary">Đang tải…</span>
+      ) : !list.length ? (
+        <p className="secondary">
+          Không đọc được danh sách tài khoản.{' '}
+          <a className="link" href="#/zalo">
+            Mở trang tài khoản Zalo
+          </a>
+        </p>
+      ) : (
+        <div className="stack">
+          <div className="accounts-summary">
+            <span className="accounts-summary-count nums">
+              {ready}
+              <span className="secondary"> / {list.length}</span>
+            </span>
+            <span className="secondary small">
+              tài khoản đã đăng nhập · tối đa {accounts?.maxAccounts}
+            </span>
+          </div>
+          <ul className="accounts-mini">
+            {list.map((a) => {
+              const k = phaseKind(a.phase);
+              const tone = !a.enabled ? 'neutral' : k === 'ready' ? 'ok' : 'warn';
+              return (
+                <li key={a.id}>
+                  <a href={`#/zalo/${encodeURIComponent(a.id)}`} className="accounts-mini-row">
+                    <span className="zalo-account-avatar">
+                      <Avatar name={accountName(a)} src={a.avatar} size={28} />
+                      {a.badge > 0 && <span className="unread-badge nums">{a.badge > 99 ? '99+' : a.badge}</span>}
+                    </span>
+                    <span className="truncate">{accountName(a)}</span>
+                    <Badge tone={tone} dot>
+                      {!a.enabled ? 'Đã tắt' : k === 'ready' ? 'Đã đăng nhập' : k === 'login' ? 'Chờ quét mã QR' : PHASE_LABEL[k] ?? k}
+                    </Badge>
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+          {waiting.length > 0 && (
+            <div className="account-hint">
+              <Info size={15} />
+              <span>
+                {waiting.length === 1 ? `${accountName(waiting[0])} chưa đăng nhập` : `${waiting.length} tài khoản chưa đăng nhập`}: người dùng chưa dùng được cho tới khi quét mã QR.{' '}
+                <a className="link" href={`#/zalo/${encodeURIComponent(waiting[0].id)}`}>
+                  Đăng nhập bằng mã QR
+                </a>
+              </span>
+            </div>
+          )}
+          <DescriptionList
+            items={[
+              { label: 'Đang sử dụng', value: usage },
+              {
+                label: 'Quyền truy cập',
+                value: (
+                  <a className="link" href="#/grants">
+                    Xem phân quyền <ArrowRight size={13} className="inline-icon" />
+                  </a>
+                ),
+              },
+              { label: 'Hoạt động', value: <a className="link" href="#/activity">Thao tác trên Zalo <ArrowRight size={13} className="inline-icon" /></a> },
+            ]}
+          />
+        </div>
+      )}
+    </Card>
+  );
 }

@@ -41,17 +41,29 @@ export interface Subject {
 export interface Grant {
   id: string;
   subject: Subject;
+  /** A Zalo account id, or "*" = every account (present and future; requires scope.all). */
+  account: string;
   role: Role;
   scope: Scope;
   note: string;
   createdAt: Timestamp;
 }
 
-export interface EffectiveAccess {
-  /** "admin" for admins; null when the user has no grant (scope is then null too). */
-  role: Role | 'admin' | null;
-  scope: Scope | null;
-  via: { grantId: string; subject: Subject; role: Role }[];
+/** Access to one Zalo account: the highest role and the union of scopes over the user's and groups' grants. */
+export interface AccountAccess {
+  role: Role | 'admin';
+  scope: Scope;
+}
+
+/** Access of a user over every Zalo account (`/api/me`, `/api/admin/access/<id>`). No key = no access there. */
+export interface MultiAccess {
+  admin: boolean;
+  accounts: Record<string, AccountAccess>;
+}
+
+export interface EffectiveAccess extends MultiAccess {
+  user?: UserBrief;
+  via: { grantId: string; subject: Subject; account: string; role: Role; scope?: Scope }[];
 }
 
 export type MeRole = 'admin' | Role | null;
@@ -60,7 +72,10 @@ export interface Me {
   user: User;
   /** The session making the request (to mark "Phiên hiện tại"). */
   sessionId?: string;
-  access: { role: MeRole; scope: Scope | null };
+  /** Never null here (the API's null is normalized to `{admin: false, accounts: {}}`). */
+  access: MultiAccess;
+  /** Summaries of the accounts the user may see, when the server sends them (`/api/me` → `accounts: [...]`). */
+  accountList?: Pick<ZaloAccount, 'id' | 'name' | 'label' | 'avatar'>[];
 }
 
 export interface LdapConfig {
@@ -270,3 +285,36 @@ export interface ActivityStats {
 }
 
 export type ActivityGroupBy = 'user' | 'day' | 'account' | 'conversation';
+
+// ---- Multiple Zalo accounts (M5) ----
+
+/** One Zalo account of the host (`GET /api/admin/accounts`). */
+export interface ZaloAccount {
+  id: string;
+  /** The Zalo user id once signed in. */
+  uid: string;
+  /** The Zalo display name. */
+  name: string;
+  /** An admin-set display label ("" = use the Zalo name). */
+  label: string;
+  avatar: string;
+  order: number;
+  enabled: boolean;
+  /** The account the host app shows. */
+  active: boolean;
+  /** Engine phase kind ("ready", "login", …), or the phase object. */
+  phase: string | { kind: string };
+  /** Unread count. */
+  badge: number;
+}
+
+export interface ZaloAccounts {
+  active: string;
+  maxAccounts: number;
+  accounts: ZaloAccount[];
+}
+
+export interface ZaloAccountDetail {
+  account: ZaloAccount;
+  phase: ZaloPhase | null;
+}

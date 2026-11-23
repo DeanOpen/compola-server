@@ -5,10 +5,12 @@ import { ArrowDown, ArrowUp, ArrowUpDown, BarChart3, Clock, Download, MessageSqu
 import { api, type ActivityQuery } from '../api';
 import { dayKey, formatDuration, frameRange, startOfDay, type Frame } from '../activity';
 import { personText } from '../format';
+import { accountName } from '../access';
+import { AccountChip, useAccounts } from '../accountsView';
 import { useLoad } from '../hooks';
 import { navigate } from '../router';
 import { toastError } from '../store';
-import type { ActivityGroupBy, ActivityStats, ActivityStatsRow, User } from '../types';
+import type { ActivityGroupBy, ActivityStats, ActivityStatsRow, User, ZaloAccount } from '../types';
 import { Button, cx, Empty, Loadable, PageHeader, Segmented, Stat, Toggle } from '../ui';
 
 type Range = 'today' | '7d' | '30d' | 'month' | 'custom';
@@ -48,15 +50,9 @@ export function StatsPage() {
     () => ({ userId: userId || undefined, account: account || undefined, ...frameRange(range as Frame, custom) }),
     [userId, account, range, custom],
   );
-  const accounts = useLoad(
-    () =>
-      api
-        .activityStats({ groupBy: 'account', ...frameRange('30d') })
-        .then((s) => s.rows.map((r) => r.key))
-        .catch(() => [] as string[]),
-    [],
-  );
-  const showAccounts = (accounts.data ?? []).some((a) => a !== '');
+  // Zalo accounts of the host (M5): filter and "Theo tài khoản" only with more than one.
+  const accounts = useAccounts();
+  const showAccounts = accounts.list.length > 1;
 
   const table = useLoad(() => api.activityStats({ ...query, groupBy }), [query, groupBy]);
   const daily = useLoad(() => loadDaily(query, stack && !userId), [query, stack, userId]);
@@ -122,9 +118,9 @@ export function StatsPage() {
         {showAccounts && (
           <select className="input input-auto" value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Tài khoản Zalo">
             <option value="">Mọi tài khoản Zalo</option>
-            {(accounts.data ?? []).map((a) => (
-              <option key={a} value={a}>
-                {a || 'Tài khoản mặc định'}
+            {accounts.list.map((a) => (
+              <option key={a.id} value={a.id}>
+                {accountName(a)}
               </option>
             ))}
           </select>
@@ -174,7 +170,7 @@ export function StatsPage() {
                   />
                 </div>
               </div>
-              <StatsTable stats={s} groupBy={groupBy} users={users.data ?? []} />
+              <StatsTable stats={s} groupBy={groupBy} users={users.data ?? []} accounts={accounts.byId} />
             </section>
           </>
         )}
@@ -349,7 +345,7 @@ function DailyChart({ data }: { data: Daily }) {
 
 // ---- Table ----
 
-function StatsTable({ stats, groupBy, users }: { stats: ActivityStats; groupBy: TableGroup; users: User[] }) {
+function StatsTable({ stats, groupBy, users, accounts }: { stats: ActivityStats; groupBy: TableGroup; users: User[]; accounts: Map<string, ZaloAccount> }) {
   const [sort, setSort] = useState<{ key: Metric | 'label'; dir: 1 | -1 }>({ key: 'sent', dir: -1 });
   const userById = new Map(users.map((u) => [u.id, u]));
   const rows = [...stats.rows].sort((a, b) => {
@@ -374,7 +370,7 @@ function StatsTable({ stats, groupBy, users }: { stats: ActivityStats; groupBy: 
         </button>
       );
     }
-    if (groupBy === 'account') return <span>{r.label || 'Tài khoản mặc định'}</span>;
+    if (groupBy === 'account') return <AccountChip id={r.key || 'default'} account={accounts.get(r.key || 'default')} size={20} />;
     return <span>«{r.label || r.key}»</span>;
   };
   const first = groupBy === 'user' ? 'Người' : groupBy === 'account' ? 'Tài khoản Zalo' : 'Hội thoại';

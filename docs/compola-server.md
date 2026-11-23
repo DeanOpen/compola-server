@@ -213,3 +213,29 @@ The desktop UI also runs in the browser at `<server>/web/` (built with `npm run 
 `src-tauri/web-dist`). It signs in with the console's cookie session (`/admin/#/login?next=/web/`), talks to `GET /ws`
 with that cookie (Origin must be the server's own), loads media from `/media/load` and uploads through `/upload`
 (cookie + `X-Compola: 1`). Same policy as joined apps: a user needs an access grant.
+
+## Multiple Zalo accounts (M5, docs/multi-account.md §7)
+
+The server shares every account of the host. Access, mirror, policy, activity and the wire carry the account.
+
+- **Grants** gain `account: "<accountId>" | "*"` (default `"default"`; existing grants migrate to `"default"`).
+  `"*"` = every account, present and future, and requires `scope.all` (400 otherwise).
+- **Access** (`/api/me`, `/api/admin/access/<id>`, WS `hello` / `access`):
+  `{admin: bool, accounts: {<accountId>: {role, scope}}}`; admins get every account as `admin`. The highest role and
+  the union of scopes per account over the user's and groups' grants, `"*"` grants included.
+  `/api/admin/access/<id>` → `{user, admin, accounts, via: [{grantId, subject, account, role, scope}]}`.
+- **Accounts API** (admins): `GET /api/admin/accounts` → `{active, maxAccounts, accounts: [{id, uid, name, label,
+  avatar, order, enabled, active, phase, badge}]}` · `POST /api/admin/accounts` → `{id}` (a new account on its QR
+  screen) · `GET /api/admin/accounts/<id>` → `{account: summary, phase}` (`phase.login.qr` while signing in) ·
+  `POST …/<id>/qr` · `POST …/<id>/logout` · `DELETE …/<id>` (`default`: sign-out only) · `PATCH …/<id>
+  {label?, enabled?}` · `PUT /api/admin/accounts/order {ids}`. `/api/admin/zalo*` stays as an alias of `default`.
+  `GET /api/admin/conversations?account=<id>` (default `default`). Audit `zalo.*` entries carry `account`.
+- **Wire**: `hello` and `access` carry `accounts`: the account summaries the user may see (granted ones; all for
+  admins). Events are `{t: "event", account, event, payload}` with the payload tagged like on the host
+  (`account` field; `badge` → `{account, count}`; `page` → `{account, page}`). Invokes select with `args.account`
+  (missing → the user's first account in order). Media: `/media/load?…&account=` is checked against access.
+- **Activity** entries carry the account id and its uid; the console's account filter lists the accounts.
+- **Joined app / web client**: the switcher lists the server's accounts from `hello` (`remote_accounts_list`).
+  Choosing one is local (`remote_account_set_active`): the joined UI shows that account's events (or all accounts'
+  with `ui_set_event_scope("all")`), and `remote_invoke` fills `args.account` with it. `account_add|remove|
+  set_enabled|rename|reorder` are not available in a joined app (admins manage accounts in Quản trị máy chủ).

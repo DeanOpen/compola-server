@@ -828,23 +828,22 @@ button.chip {
   margin-left: auto;
 }
 .brand-mark {
+  /* The SVG draws its tile at 100..924 of 1024: the image is scaled up so the tile itself fills the box. */
+  position: relative;
   width: 26px;
   height: 26px;
-  border-radius: 7px;
-  background: linear-gradient(135deg, #2a83ff, #0058d6);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
-  color: #fff;
-  display: grid;
-  place-items: center;
-  font-weight: 700;
-  font-size: 14px;
   flex-shrink: 0;
+}
+.brand-mark img {
+  position: absolute;
+  inset: -12.15%;
+  width: 124.3%;
+  height: 124.3%;
+  display: block;
 }
 .brand-mark-lg {
   width: 44px;
   height: 44px;
-  border-radius: 11px;
-  font-size: 22px;
 }
 .nav {
   display: flex;
@@ -3945,4 +3944,212 @@ form > .save-bar {
 .filter-pop-list .menu-item,
 .menu > .menu-item {
   flex-shrink: 0;
+}
+
+/* ---------- Zalo accounts (M5) ---------- */
+
+.zalo-accounts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.zalo-account-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px 10px 6px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+.zalo-account-row:first-child {
+  border-top: 0;
+}
+.zalo-account-row.is-dragging {
+  opacity: 0.5;
+}
+.zalo-account-row.is-over {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.zalo-account-row.is-disabled .zalo-account-main {
+  opacity: 0.6;
+}
+.drag-handle {
+  color: var(--text-tertiary);
+  cursor: grab;
+  display: grid;
+  place-items: center;
+}
+.order-buttons {
+  display: flex;
+  flex-direction: column;
+}
+.btn.btn-xs {
+  height: 18px;
+  width: 22px;
+  padding: 0;
+}
+.zalo-account-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: inherit;
+  text-decoration: none !important;
+}
+.zalo-account-main:hover strong {
+  color: var(--accent-text);
+}
+.zalo-account-avatar {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.unread-badge {
+  position: absolute;
+  top: -4px;
+  right: -6px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.zalo-account-row .badge {
+  margin: 0;
+  flex-shrink: 0;
+}
+.back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: -6px;
+}
+.account-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.account-chip .truncate {
+  max-width: 180px;
+}
+.account-access-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.account-access {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.account-access-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+@media (max-width: 600px) {
+  .order-buttons {
+    display: none;
+  }
+  .zalo-account-row {
+    flex-wrap: wrap;
+    padding-left: 12px;
+  }
+  .zalo-account-main {
+    flex-basis: calc(100% - 30px);
+  }
+}
+.access-accounts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.access-accounts li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.access-accounts .badge {
+  margin: 0;
+}
+.account-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 8px;
+}
+.account-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  min-width: 0;
+}
+.account-option.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.split-side-head {
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.accounts-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.accounts-summary-count {
+  font-size: 26px;
+  font-weight: 650;
+}
+.accounts-mini {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.accounts-mini-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 6px;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  text-decoration: none !important;
+}
+.accounts-mini-row:hover {
+  background: var(--hover);
+}
+.accounts-mini-row .truncate {
+  flex: 1;
+}
+.accounts-mini-row .badge {
+  margin: 0;
+}
+.picker-account {
+  margin-bottom: 10px;
 }

@@ -259,7 +259,10 @@ async fn route(ctx: &Ctx<'_>, method: &str, seg: &[&str]) -> R<Reply> {
         ("GET", ["me"]) => {
             let (session, user) = ctx.current()?;
             let (access, via) = ctx.auth.store.access_of(&user)?;
-            Ok(Reply::ok(json!({ "user": user, "session": session, "access": access, "via": via })))
+            // The accounts this user may see (summaries, like the WebSocket `hello`), for names in "Tài khoản của tôi".
+            let accounts = access.as_ref().map(|a| ctx.remote.accounts_for(a)["accounts"].clone()).unwrap_or_else(|| json!([]));
+            let access = access.map(|a| a.expanded(&ctx.remote.account_ids()));
+            Ok(Reply::ok(json!({ "user": user, "session": session, "access": access, "via": via, "accounts": accounts })))
         }
 
         ("GET", ["me", "sessions"]) => {
@@ -423,6 +426,8 @@ struct GroupBody {
 #[serde(rename_all = "camelCase")]
 struct GrantBody {
     subject: Option<Subject>,
+    /// A Zalo account id or `"*"` (default `default`).
+    account: Option<String>,
     role: Option<Role>,
     scope: Option<Scope>,
     note: Option<String>,
@@ -489,7 +494,8 @@ async fn admin_route(ctx: &Ctx<'_>, admin: &User, method: &str, seg: &[&str]) ->
         ("GET", ["access", user_id]) => {
             let user = store.user(user_id)?;
             let (access, via) = store.access_of(&user)?;
-            Ok(Reply::ok(json!({ "user": user.brief(), "role": access.as_ref().map(|a| a.role), "scope": access.map(|a| a.scope), "via": via })))
+            let expanded = access.map(|a| a.expanded(&remote.account_ids())).unwrap_or_else(|| json!({ "admin": false, "accounts": {} }));
+            Ok(Reply::ok(json!({ "user": user.brief(), "admin": expanded["admin"], "accounts": expanded["accounts"], "via": via })))
         }
 
         // groups
@@ -529,15 +535,16 @@ async fn admin_route(ctx: &Ctx<'_>, admin: &User, method: &str, seg: &[&str]) ->
         ("POST", ["grants"]) => {
             let b: GrantBody = parse(ctx.body)?;
             let subject = b.subject.ok_or_else(|| bad("Chọn người dùng hoặc nhóm."))?;
-            let grant = store.create_grant(subject, b.role.unwrap_or(Role::Viewer), b.scope.unwrap_or_default(), b.note.as_deref().unwrap_or_default())?;
-            ctx.audit(admin, "grant.create", &grant.subject.id, json!({ "role": grant.role, "scope": grant.scope }));
+            let account = b.account.as_deref().unwrap_or(crate::account::DEFAULT_ID);
+            let grant = store.create_grant(subject, account, b.role.unwrap_or(Role::Viewer), b.scope.unwrap_or_default(), b.note.as_deref().unwrap_or_default())?;
+            ctx.audit(admin, "grant.create", &grant.subject.id, json!({ "account": grant.account, "role": grant.role, "scope": grant.scope }));
             remote.access_changed();
             Ok(Reply::json(201, json!(grant)))
         }
         ("PATCH", ["grants", id]) => {
             let b: GrantBody = parse(ctx.body)?;
-            let grant = store.update_grant(id, b.role, b.scope, b.note.as_deref())?;
-            ctx.audit(admin, "grant.update", &grant.subject.id, json!({ "role": grant.role, "scope": grant.scope }));
+            let grant = store.update_grant(id, b.account.as_deref(), b.role, b.scope, b.note.as_deref())?;
+            ctx.audit(admin, "grant.update", &grant.subject.id, json!({ "account": grant.account, "role": grant.role, "scope": grant.scope }));
             remote.access_changed();
             Ok(Reply::ok(json!(grant)))
         }
@@ -661,7 +668,78 @@ async fn admin_route(ctx: &Ctx<'_>, admin: &User, method: &str, seg: &[&str]) ->
         }
 
         // the account
-        ("GET", ["conversations"]) => Ok(Reply::ok(remote.mirror.read().conversations_json())),
+        ("GET", ["conversations"]) => {
+            let account = ctx.head.param("account").filter(|a| !a.is_empty()).unwrap_or_else(|| crate::account::DEFAULT_ID.into());
+            if !crate::account::valid_id(&account) {
+                return Err(bad("Tài khoản Zalo không hợp lệ."));
+            }
+            Ok(Reply::ok(remote.with_mirror(&account, |m| m.conversations_json())))
+        }
+
+        // the host's Zalo accounts (docs: "Multiple Zalo accounts")
+        ("GET", ["accounts"]) => Ok(Reply::ok(json!(remote.account_list()))),
+        ("POST", ["accounts"]) => {
+            let id = crate::account::admin_add(&remote.app).map_err(bad)?;
+            ctx.audit(admin, "zalo.add", &id, json!({ "account": id }));
+            Ok(Reply::json(201, json!({ "id": id })))
+        }
+        ("PUT", ["accounts", "order"]) => {
+            #[derive(Deserialize, Default)]
+            #[serde(default)]
+            struct B {
+                ids: Vec<String>,
+            }
+            let b: B = parse(ctx.body)?;
+            crate::account::admin_reorder(&remote.app, &b.ids).map_err(bad)?;
+            ctx.audit(admin, "zalo.reorder", "", json!({ "ids": b.ids }));
+            Ok(Reply::ok(json!(remote.account_list())))
+        }
+        ("GET", ["accounts", id]) => {
+            let id = account_id(id)?;
+            let summary = remote.account_list().and_then(|l| l.accounts.into_iter().find(|a| a.id == id)).ok_or_else(|| StoreError::new(404, "Tài khoản không tồn tại"))?;
+            let phase = crate::account::admin_phase(&remote.app, &id).map_err(bad)?;
+            Ok(Reply::ok(json!({ "account": summary, "phase": phase })))
+        }
+        ("POST", ["accounts", id, "qr"]) => {
+            let id = account_id(id)?;
+            crate::account::admin_refresh_qr(&remote.app, &id).map_err(bad)?;
+            ctx.audit(admin, "zalo.qr", &id, json!({ "account": id }));
+            Ok(Reply::ok(json!({ "ok": true })))
+        }
+        ("POST", ["accounts", id, "logout"]) => {
+            let id = account_id(id)?;
+            let name = remote.account_names().get(&id).cloned().unwrap_or_default();
+            crate::account::admin_logout(&remote.app, &id).map_err(bad)?;
+            ctx.audit(admin, "zalo.logout", name.as_str().unwrap_or_default(), json!({ "account": id }));
+            Ok(Reply::ok(json!({ "ok": true })))
+        }
+        ("DELETE", ["accounts", id]) => {
+            let id = account_id(id)?;
+            let name = remote.account_names().get(&id).cloned().unwrap_or_default();
+            crate::account::admin_remove(&remote.app, &id).map_err(bad)?;
+            ctx.audit(admin, "zalo.remove", name.as_str().unwrap_or_default(), json!({ "account": id }));
+            remote.access_changed();
+            Ok(Reply::ok(json!({ "ok": true })))
+        }
+        ("PATCH", ["accounts", id]) => {
+            #[derive(Deserialize, Default)]
+            #[serde(default)]
+            struct B {
+                label: Option<String>,
+                enabled: Option<bool>,
+            }
+            let id = account_id(id)?;
+            let b: B = parse(ctx.body)?;
+            if let Some(enabled) = b.enabled {
+                crate::account::admin_set_enabled(&remote.app, &id, enabled).map_err(bad)?;
+            }
+            if let Some(label) = b.label {
+                let label = label.trim().to_owned();
+                crate::account::admin_rename(&remote.app, &id, (!label.is_empty()).then_some(label)).map_err(bad)?;
+            }
+            ctx.audit(admin, "zalo.update", &id, json!({ "account": id, "enabled": b.enabled }));
+            Ok(Reply::ok(json!(remote.account_list())))
+        }
         ("GET", ["server"]) => Ok(Reply::ok(remote.server_info_json())),
         ("PATCH", ["server"]) => {
             #[derive(Deserialize, Default)]
@@ -677,6 +755,11 @@ async fn admin_route(ctx: &Ctx<'_>, admin: &User, method: &str, seg: &[&str]) ->
         }
         _ => Err(StoreError::new(404, "Không có API này.")),
     }
+}
+
+/// A Zalo account id from a URL (it ends up in paths and labels on the host).
+fn account_id(id: &str) -> R<String> {
+    if crate::account::valid_id(id) { Ok(id.to_owned()) } else { Err(StoreError::new(404, "Tài khoản không tồn tại")) }
 }
 
 fn activity_filter(ctx: &Ctx<'_>) -> super::store::ActivityFilter {

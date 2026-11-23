@@ -1,10 +1,12 @@
 import { LogOut } from 'lucide-react';
 import { deviceText } from './Sessions';
 import { api, ApiError } from '../api';
-import { formatDateTime, formatRelative, ROLE_HINT, roleLabel, scopeSummary, sourceInfo } from '../format';
+import { formatDateTime, formatRelative, ROLE_HINT, roleLabel, sourceInfo } from '../format';
+import { topRole } from '../access';
+import { AccessByAccount, useAccounts, type AccountBrief } from '../accountsView';
 import { useLoad } from '../hooks';
 import { confirmDialog, toast, toastError, useMe } from '../store';
-import type { Session } from '../types';
+import type { Me, Session } from '../types';
 import { Avatar, Badge, Button, Card, DeviceLabel, Empty, PageHeader, Spinner } from '../ui';
 
 export function MePage() {
@@ -18,10 +20,10 @@ export function MePage() {
       }),
     [],
   );
+  const accounts = useMyAccounts(me);
   if (!me) return null;
   const { user, access } = me;
-  const role = user.isAdmin ? 'admin' : access.role;
-  const scope = user.isAdmin ? { all: true, conversations: [], labels: [] } : access.scope;
+  const role = topRole(me);
 
   const revoke = async (s: Session) => {
     const ok = await confirmDialog({
@@ -79,16 +81,19 @@ export function MePage() {
       </Card>
 
       <Card title="Quyền của tôi">
-        {role ? (
+        {role === 'admin' ? (
           <dl className="kv">
             <dt>Vai trò</dt>
             <dd>
-              <Badge tone="accent">{roleLabel(role)}</Badge>
-              <div className="field-hint">{ROLE_HINT[role]}</div>
+              <Badge tone="accent">{roleLabel('admin')}</Badge>
+              <div className="field-hint">{ROLE_HINT.admin} Áp dụng cho mọi tài khoản Zalo của máy chủ.</div>
             </dd>
-            <dt>Phạm vi</dt>
-            <dd>{scopeSummary(scope)}</dd>
           </dl>
+        ) : role ? (
+          <div className="stack">
+            <span className="secondary small">Quyền của bạn trên từng tài khoản Zalo của máy chủ:</span>
+            <AccessByAccount access={access} accounts={accounts} />
+          </div>
         ) : (
           <Empty title="Bạn chưa được cấp quyền">Hãy nhờ quản trị viên máy chủ cấp quyền dùng tài khoản Zalo cho bạn.</Empty>
         )}
@@ -152,4 +157,13 @@ export function MePage() {
       )}
     </div>
   );
+}
+
+/** Names of the accounts the signed-in user may see: from `/api/me` (`accounts`), plus the full list for admins. */
+export function useMyAccounts(me: Me | null): Map<string, AccountBrief> {
+  const admin = useAccounts(!!me?.user.isAdmin);
+  const map = new Map<string, AccountBrief>();
+  for (const a of me?.accountList ?? []) map.set(a.id, a);
+  for (const a of admin.list) map.set(a.id, a);
+  return map;
 }

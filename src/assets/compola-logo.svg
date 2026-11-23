@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2F8BFF"/>
+      <stop offset="1" stop-color="#0052D9"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS squircle tile -->
+  <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#shine)"/>
+  <!-- "C" formed by a speech bubble with an open mouth -->
+  <path d="M 676 382 A 200 200 0 1 0 676 642" fill="none" stroke="#FFFFFF" stroke-width="96" stroke-linecap="round"/>
+  <path d="M 356 650 L 300 744 L 418 694 Z" fill="#FFFFFF"/>
+  <!-- three dots: a conversation -->
+  <circle cx="600" cy="512" r="34" fill="#FFFFFF"/>
+  <circle cx="720" cy="512" r="34" fill="#FFFFFF" opacity="0.85"/>
+</svg>

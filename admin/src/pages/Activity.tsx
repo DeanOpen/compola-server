@@ -6,6 +6,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { ChevronRight, Download, MessagesSquare, RefreshCw, X } from 'lucide-react';
 import { api, type ActivityQuery } from '../api';
 import { ACTIVITY_CATEGORIES, activityVerb, CATEGORY_TONE, categoryOf, formatDuration, frameRange, type Frame } from '../activity';
+import { accountName } from '../access';
+import { useAccounts } from '../accountsView';
 import { formatDateTime, formatRelative, personText, shortId } from '../format';
 import { useLoad } from '../hooks';
 import { navigate, useRoute } from '../router';
@@ -31,7 +33,7 @@ export function ActivityDevice({ device }: { device: ActivityEntry['device'] }) 
   );
 }
 
-export function ActivitySentence({ e }: { e: ActivityEntry }) {
+export function ActivitySentence({ e, accountLabel }: { e: ActivityEntry; accountLabel?: string }) {
   const name = e.user ? (e.user.displayName && e.user.displayName !== e.user.username ? e.user.displayName : null) : null;
   const base = activityVerb(e.action, e.detail?.call);
   // A refused / failed call: "đã thử gửi tin nhắn … · không thành công".
@@ -58,6 +60,7 @@ export function ActivitySentence({ e }: { e: ActivityEntry }) {
       )}
       {e.ok && e.responseMs !== null && <span className="activity-response"> · phản hồi sau {formatDuration(e.responseMs)}</span>}
       {!e.ok && <span className="activity-failed"> · không thành công</span>}
+      {accountLabel && <span className="secondary"> · {accountLabel}</span>}
     </span>
   );
 }
@@ -77,17 +80,17 @@ export function ActivityPage() {
   }, [route.query]);
 
   const users = useLoad<User[]>(() => api.users().catch(() => []), []);
-  const account_ = useLoad<AccountData>(() => api.accountData().catch(() => ({ conversations: [], labels: [] })), []);
-  // Zalo accounts seen in the last 30 days; the filter stays hidden while there is only the default "" account.
-  const accounts = useLoad(
-    () =>
-      api
-        .activityStats({ groupBy: 'account', ...frameRange('30d') })
-        .then((s) => s.rows.map((r) => r.key))
-        .catch(() => [] as string[]),
-    [],
+  // Zalo accounts of the host (M5): the filter and the "· <account>" suffix only matter with more than one.
+  const accounts = useAccounts();
+  const multi = accounts.list.length > 1;
+  const accountLabel = (id: string) => accountName(accounts.byId.get(id), id || 'default');
+  // Conversations for the picker: of the chosen account (conversation ids are per account).
+  const [pickAccount, setPickAccount] = useState('');
+  const pickerAccount = pickAccount || account || accounts.list[0]?.id || 'default';
+  const account_ = useLoad<AccountData>(
+    () => api.accountData(pickerAccount === 'default' && !multi ? undefined : pickerAccount).catch(() => ({ conversations: [], labels: [] })),
+    [pickerAccount, multi],
   );
-  const showAccounts = (accounts.data ?? []).some((a) => a !== '');
 
   const query: ActivityQuery = useMemo(
     () => ({
@@ -181,12 +184,20 @@ export function ActivityPage() {
               </option>
             ))}
         </select>
-        {showAccounts && (
-          <select className="input input-auto" value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Tài khoản Zalo">
+        {multi && (
+          <select
+            className="input input-auto"
+            value={account}
+            onChange={(e) => {
+              setAccount(e.target.value);
+              setConversation(null);
+            }}
+            aria-label="Tài khoản Zalo"
+          >
             <option value="">Mọi tài khoản Zalo</option>
-            {(accounts.data ?? []).map((a) => (
-              <option key={a} value={a}>
-                {a || 'Tài khoản mặc định'}
+            {accounts.list.map((a) => (
+              <option key={a.id} value={a.id}>
+                {accountName(a)}
               </option>
             ))}
           </select>
@@ -244,7 +255,7 @@ export function ActivityPage() {
                       <button type="button" className="audit-main" onClick={() => toggle(e.id)} aria-expanded={expanded}>
                         <Avatar name={name} size={32} />
                         <span className="audit-body">
-                          <ActivitySentence e={e} />
+                          <ActivitySentence e={e} accountLabel={multi ? accountLabel(e.account) : undefined} />
                           <span className="audit-meta">
                             <Badge tone={e.ok ? CATEGORY_TONE[cat.key] : 'danger'}>{cat.label}</Badge>
                             <span title={formatDateTime(e.at)}>{formatRelative(e.at)}</span>
@@ -294,6 +305,15 @@ export function ActivityPage() {
       </Loadable>
       {picking && (
         <Modal title="Lọc theo hội thoại" onClose={() => setPicking(false)}>
+          {multi && (
+            <select className="input picker-account" value={pickerAccount} onChange={(e) => setPickAccount(e.target.value)} aria-label="Tài khoản Zalo">
+              {accounts.list.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {accountName(a)}
+                </option>
+              ))}
+            </select>
+          )}
           <SinglePicker
             items={(account_.data?.conversations ?? []).map((c) => ({ id: c.id, label: c.name || c.id, sub: c.isGroup ? 'Nhóm' : 'Cá nhân', avatar: c.avatar, group: c.isGroup }))}
             value={conversation?.id ?? null}
@@ -301,6 +321,8 @@ export function ActivityPage() {
             onChange={(id) => {
               const c = account_.data?.conversations.find((x) => x.id === id);
               setConversation(c ? { id: c.id, name: c.name } : null);
+              // A conversation id belongs to one account: filter on that account too.
+              if (c && multi) setAccount(pickerAccount);
               setPicking(false);
             }}
           />

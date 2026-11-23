@@ -18,6 +18,9 @@ import type {
   Session,
   User,
   ZaloStatus,
+  MultiAccess,
+  ZaloAccountDetail,
+  ZaloAccounts,
   ActivityEntry,
   ActivityGroupBy,
   ActivityStats,
@@ -144,6 +147,19 @@ function one<T>(value: unknown, key: string): T {
 
 const enc = encodeURIComponent;
 
+/** Access in the M5 shape `{admin, accounts}`. Also reads the older single-account shape `{role, scope}` (as the
+ *  "default" account) and `null` (no access). */
+export function normalizeAccess(raw: unknown, isAdmin: boolean): MultiAccess {
+  const r = (raw ?? null) as { admin?: boolean; accounts?: MultiAccess['accounts']; role?: string | null; scope?: unknown } | null;
+  if (r && r.accounts && typeof r.accounts === 'object') return { admin: !!r.admin || isAdmin, accounts: r.accounts };
+  if (r && r.role) {
+    const role = r.role as MultiAccess['accounts'][string]['role'];
+    const scope = (r.scope as MultiAccess['accounts'][string]['scope'] | null) ?? { all: true, conversations: [], labels: [] };
+    return { admin: role === 'admin' || isAdmin, accounts: { default: { role, scope } } };
+  }
+  return { admin: isAdmin, accounts: {} };
+}
+
 /** Filters shared by the activity endpoints (empty values are left out). `action` is exact or a prefix; several
  *  values are comma-separated (one category covers several actions). */
 export type ActivityQuery = {
@@ -180,8 +196,18 @@ export const api = {
     ),
   logout: () => request<unknown>('POST', '/api/auth/logout', {}, { auth: false }),
   me: () =>
-    request<Partial<Me> & { user: User; session?: { id: string } | null }>('GET', '/api/me', undefined, { auth: false }).then(
-      (r): Me => ({ user: r.user, sessionId: r.session?.id, access: { role: r.access?.role ?? null, scope: r.access?.scope ?? null } }),
+    request<{ user: User; session?: { id: string } | null; access?: unknown; accounts?: Record<string, string> | Me['accountList'] }>('GET', '/api/me', undefined, { auth: false }).then(
+      (r): Me => ({
+        user: r.user,
+        sessionId: r.session?.id ?? undefined,
+        access: normalizeAccess(r.access, r.user.isAdmin),
+        // `accounts: {<id>: name}` (names of the accounts the user may see); a list of summaries is accepted too.
+        accountList: Array.isArray(r.accounts)
+          ? r.accounts
+          : r.accounts && typeof r.accounts === 'object'
+            ? Object.entries(r.accounts).map(([id, name]) => ({ id, name: String(name ?? ''), label: '', avatar: '' }))
+            : undefined,
+      }),
     ),
   mySessions: () => request<unknown>('GET', '/api/me/sessions').then((r) => list<Session>(r, 'sessions')),
   revokeMySession: (id: string) => request<unknown>('DELETE', `/api/me/sessions/${enc(id)}`),
@@ -226,9 +252,13 @@ export const api = {
   updateGrant: (id: string, patch: Partial<Omit<Grant, 'id' | 'createdAt'>>) =>
     request<unknown>('PATCH', `/api/admin/grants/${enc(id)}`, patch),
   deleteGrant: (id: string) => request<unknown>('DELETE', `/api/admin/grants/${enc(id)}`),
-  access: (userId: string) => request<EffectiveAccess>('GET', `/api/admin/access/${enc(userId)}`),
-  accountData: () =>
-    request<Partial<AccountData>>('GET', '/api/admin/conversations').then((r) => ({
+  access: (userId: string) =>
+    request<EffectiveAccess & { role?: unknown }>('GET', `/api/admin/access/${enc(userId)}`).then(
+      (r): EffectiveAccess => ({ ...normalizeAccess(r, false), user: r.user, via: r.via ?? [] }),
+    ),
+  /** Conversations and labels of one Zalo account (default: "default"). */
+  accountData: (account?: string) =>
+    request<Partial<AccountData>>('GET', `/api/admin/conversations${account ? `?account=${enc(account)}` : ''}`).then((r) => ({
       conversations: r?.conversations ?? [],
       labels: r?.labels ?? [],
     })),
@@ -284,6 +314,23 @@ export const api = {
   },
 
   // The host's Zalo account
+  // Zalo accounts of the host (M5). `/api/admin/zalo*` stays an alias of "default".
+  accounts: () =>
+    request<Partial<ZaloAccounts>>('GET', '/api/admin/accounts').then(
+      (r): ZaloAccounts => ({
+        active: r?.active ?? 'default',
+        maxAccounts: r?.maxAccounts ?? 1,
+        accounts: [...(r?.accounts ?? [])].sort((a, b) => a.order - b.order),
+      }),
+    ),
+  account: (id: string) => request<ZaloAccountDetail>('GET', `/api/admin/accounts/${enc(id)}`),
+  addAccount: () => request<{ id: string }>('POST', '/api/admin/accounts', {}),
+  accountQr: (id: string) => request<unknown>('POST', `/api/admin/accounts/${enc(id)}/qr`, {}),
+  accountLogout: (id: string) => request<unknown>('POST', `/api/admin/accounts/${enc(id)}/logout`, {}),
+  deleteAccount: (id: string) => request<unknown>('DELETE', `/api/admin/accounts/${enc(id)}`),
+  updateAccount: (id: string, patch: { label?: string; enabled?: boolean }) => request<unknown>('PATCH', `/api/admin/accounts/${enc(id)}`, patch),
+  reorderAccounts: (ids: string[]) => request<unknown>('PUT', '/api/admin/accounts/order', { ids }),
+
   zalo: () => request<ZaloStatus>('GET', '/api/admin/zalo'),
   zaloQr: () => request<unknown>('POST', '/api/admin/zalo/qr', {}),
   zaloLogout: () => request<unknown>('POST', '/api/admin/zalo/logout', {}),

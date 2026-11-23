@@ -24,12 +24,13 @@ import {
 } from 'lucide-react';
 import { api, ApiError, isMock, setUnauthorizedHandler } from './api';
 import { roleLabel, serverHealth } from './format';
+import { topRole } from './access';
 import { CommandPalette, isMac, useCommandShortcut, type Command } from './command';
 import { useInterval, useLoad } from './hooks';
 import { navigate, useRoute, type Route } from './router';
 import { toastError, useStore, type Theme } from './store';
 import type { Me } from './types';
-import { Avatar, Badge, ConfirmHost, cx, Empty, ErrorBox, Kbd, MenuButtons, Popover, Segmented, Spinner, StatusDot, Toasts } from './ui';
+import { Avatar, Badge, BrandMark, ConfirmHost, cx, Empty, ErrorBox, Kbd, MenuButtons, Popover, Segmented, Spinner, StatusDot, Toasts } from './ui';
 import { SignInPage } from './pages/SignIn';
 import { DevicePage } from './pages/Device';
 import { MePage } from './pages/Me';
@@ -86,7 +87,8 @@ const NAV_SECTIONS: { label: string | null; items: NavItem[] }[] = [
     ],
   },
 ];
-const matches = (n: NavItem, path: string) => n.path === path || !!n.also?.includes(path);
+// A nav item also covers its sub-pages (#/zalo/<id>).
+const matches = (n: NavItem, path: string) => n.path === path || !!n.also?.includes(path) || (n.path !== '/' && path.startsWith(n.path + '/'));
 
 const ME_NAV: NavItem = { path: '/me', label: 'Tài khoản của tôi', icon: <CircleUser size={16} />, render: () => <MePage /> };
 
@@ -175,7 +177,7 @@ function SignedIn({ me, route }: { me: Me; route: Route }) {
     title = ME_NAV.label;
     crumbs = ['Cá nhân', title];
   } else if (!isAdmin) {
-    page = route.path === '/' && me.access.role ? <MePage /> : <NoAdmin me={me} />;
+    page = route.path === '/' && topRole(me) ? <MePage /> : <NoAdmin me={me} />;
   } else {
     const sec = NAV_SECTIONS.find((s) => s.items.some((n) => matches(n, route.path)));
     const item = sec?.items.find((n) => matches(n, route.path));
@@ -217,7 +219,7 @@ function SignedIn({ me, route }: { me: Me; route: Route }) {
         <>
           <aside className={cx('sidebar', menuOpen && 'is-open')}>
             <div className="sidebar-brand">
-              <span className="brand-mark">C</span>
+              <BrandMark />
               <span className="sidebar-brand-text">
                 <strong>Compola Server</strong>
                 <span className="truncate" title={s?.name}>
@@ -300,7 +302,7 @@ function TopBar({ me, crumbs, onMenu, onSearch }: { me: Me; crumbs: string[]; on
         </button>
       ) : (
         <a className="topbar-brand" href="#/">
-          <span className="brand-mark">C</span>
+          <BrandMark />
           <strong>Compola Server</strong>
         </a>
       )}
@@ -342,7 +344,7 @@ function TopBar({ me, crumbs, onMenu, onSearch }: { me: Me; crumbs: string[]; on
           <div className="cell-text">
             <strong className="truncate">{name}</strong>
             <span className="secondary small truncate">
-              @{me.user.username} · {roleLabel(me.user.isAdmin ? 'admin' : me.access.role)}
+              @{me.user.username} · {roleLabel(topRole(me))}
             </span>
           </div>
         </div>
@@ -362,14 +364,14 @@ function TopBar({ me, crumbs, onMenu, onSearch }: { me: Me; crumbs: string[]; on
 }
 
 function NoAdmin({ me }: { me: Me }) {
-  const hasAccess = !!me.access.role;
+  const hasAccess = !!topRole(me);
   return (
     <div className="narrow">
       <Empty icon={<Lock size={30} />} title="Bạn không có quyền quản trị">
         {hasAccess ? (
           <>
             Tài khoản <strong>{me.user.username}</strong> được dùng Compola với vai trò{' '}
-            <Badge tone="accent">{roleLabel(me.access.role)}</Badge> nhưng không quản trị được máy chủ.
+            <Badge tone="accent">{roleLabel(topRole(me))}</Badge> nhưng không quản trị được máy chủ.
           </>
         ) : (
           <>

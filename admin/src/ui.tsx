@@ -5,6 +5,16 @@ import { AlertTriangle, Check, ChevronDown, Copy, Globe, Loader2, Lock, MonitorS
 import { ApiError } from './api';
 import { initials, shortId, sourceInfo, type ActionTone } from './format';
 import { toast, useStore } from './store';
+import logo from '../../src/assets/compola-logo.svg';
+
+/** The Compola logo (the app's own `src/assets/compola-logo.svg`); the tile fills the box, the SVG's margin is cropped by the CSS. */
+export function BrandMark({ large }: { large?: boolean }) {
+  return (
+    <span className={cx('brand-mark', large && 'brand-mark-lg')} aria-hidden="true">
+      <img src={logo} alt="" draggable={false} />
+    </span>
+  );
+}
 
 export function cx(...c: (string | false | null | undefined)[]) {
   return c.filter(Boolean).join(' ');

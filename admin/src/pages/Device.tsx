@@ -1,11 +1,14 @@
 import { useState } from 'react';
 import { ArrowLeftRight, CheckCircle2, MonitorSmartphone, XCircle } from 'lucide-react';
 import { api, ApiError } from '../api';
-import { formatDateTime, roleLabel, scopeSummary, shortId } from '../format';
+import { formatDateTime, roleLabel, shortId } from '../format';
+import { topRole } from '../access';
+import { AccessByAccount } from '../accountsView';
+import { useMyAccounts } from './Me';
 import { useLoad } from '../hooks';
 import { navigate, type Route } from '../router';
 import type { DeviceInfo, Me } from '../types';
-import { Badge, Button, DeviceLabel, ErrorBox, Field, Person, Spinner } from '../ui';
+import { Badge, BrandMark, Button, DeviceLabel, ErrorBox, Field, Person, Spinner } from '../ui';
 
 function normalizeCode(raw: string): string {
   const c = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -58,8 +61,8 @@ function Approve({ code, me }: { code: string; me: Me }) {
   const [busy, setBusy] = useState<'approve' | 'deny' | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<'approved' | 'denied' | null>(null);
-  const canUse = me.user.isAdmin || !!me.access.role;
-  const role = me.user.isAdmin ? 'admin' : me.access.role;
+  const canUse = !!topRole(me);
+  const accounts = useMyAccounts(me);
 
   const decide = async (approve: boolean) => {
     setBusy(approve ? 'approve' : 'deny');
@@ -94,7 +97,7 @@ function Approve({ code, me }: { code: string; me: Me }) {
     <div className="card card-body device-card">
       {/* Two-logo header: this server ⇄ the device asking (incident.io "Sign in with Slack"). */}
       <div className="link-logos" aria-hidden="true">
-        <span className="brand-mark brand-mark-lg">C</span>
+        <BrandMark large />
         <ArrowLeftRight size={18} className="tertiary" />
         <span className="link-logo-device">
           <MonitorSmartphone size={22} />
@@ -132,10 +135,13 @@ function Approve({ code, me }: { code: string; me: Me }) {
           <div className="identity-block">
             <span className="identity-label">Đăng nhập với tư cách</span>
             <Person user={me.user} source={me.user.source} />
-            <div>
-              <Badge tone={canUse ? 'accent' : 'warn'}>{roleLabel(role)}</Badge>
-              {canUse && !me.user.isAdmin && <span className="secondary small"> · {scopeSummary(me.access.scope)}</span>}
-            </div>
+            {me.user.isAdmin ? (
+              <div>
+                <Badge tone="accent">{roleLabel('admin')}</Badge> <span className="secondary small">· mọi tài khoản Zalo</span>
+              </div>
+            ) : (
+              <AccessByAccount access={me.access} accounts={accounts} empty={<Badge tone="warn">{roleLabel(null)}</Badge>} />
+            )}
           </div>
           {!canUse && (
             <ErrorBox message="Tài khoản của bạn chưa được cấp quyền dùng Compola trên máy chủ này. Hãy nhờ quản trị viên cấp quyền trước." />

@@ -1,7 +1,7 @@
 //! Compola Server accounts (`~/Library/Application Support/Compola/server.db`, 0600): users, groups, access grants,
 //! sessions, sign-in providers and the audit log. One connection behind a mutex: every operation is small.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
@@ -121,6 +121,8 @@ pub struct Subject {
 pub struct Grant {
     pub id: String,
     pub subject: Subject,
+    /// The Zalo account id, or `"*"` for every account.
+    pub account: String,
     pub role: Role,
     pub scope: Scope,
     pub note: String,
@@ -309,6 +311,64 @@ fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_owned() }
 }
 
+/// Columns added after the first release.
+fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has = |table: &str, column: &str| -> rusqlite::Result<bool> {
+        let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = st.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(names.iter().any(|n| n == column))
+    };
+    // Multi-account (docs/multi-account.md §7): grants name their Zalo account; older ones were for `default`.
+    if !has("grants", "account")? {
+        conn.execute_batch("ALTER TABLE grants ADD COLUMN account TEXT NOT NULL DEFAULT 'default';")?;
+    }
+    Ok(())
+}
+
+/// What a user may do, per Zalo account (docs/compola-server.md, "Multiple Zalo accounts"). `accounts` keys are
+/// account ids or `"*"` (every account).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserAccess {
+    pub admin: bool,
+    pub accounts: BTreeMap<String, Access>,
+}
+
+impl UserAccess {
+    pub fn admin() -> Self {
+        Self { admin: true, accounts: BTreeMap::new() }
+    }
+
+    /// The access on one account: admins have everything; else that account's grants merged with `"*"`.
+    pub fn for_account(&self, account: &str) -> Option<Access> {
+        if self.admin {
+            return Some(Access { role: Role::Admin, scope: Scope { all: true, ..Default::default() } });
+        }
+        let parts: Vec<&Access> = [self.accounts.get(account), self.accounts.get("*")].into_iter().flatten().collect();
+        let first = parts.first()?;
+        let role = parts.iter().map(|a| a.role).max().unwrap_or(first.role);
+        let all = parts.iter().any(|a| a.scope.all);
+        let mut conversations = BTreeSet::new();
+        let mut labels = BTreeSet::new();
+        if !all {
+            for a in &parts {
+                conversations.extend(a.scope.conversations.iter().cloned());
+                labels.extend(a.scope.labels.iter().cloned());
+            }
+        }
+        Some(Access { role, scope: Scope { all, conversations: conversations.into_iter().collect(), labels: labels.into_iter().collect() } })
+    }
+
+    /// `{admin, accounts: {<id>: {role, scope}}}` over the host's accounts (`"*"` expanded).
+    pub fn expanded(&self, account_ids: &[String]) -> Value {
+        let accounts: serde_json::Map<String, Value> = account_ids
+            .iter()
+            .filter_map(|id| self.for_account(id).map(|a| (id.clone(), serde_json::to_value(a).unwrap_or(Value::Null))))
+            .collect();
+        json!({ "admin": self.admin, "accounts": accounts })
+    }
+}
+
 // ---- store ----
 
 pub struct Store {
@@ -398,6 +458,7 @@ fn grant_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Grant> {
     Ok(Grant {
         id: r.get(0)?,
         subject: Subject { kind: r.get(1)?, id: r.get(2)? },
+        account: r.get(7)?,
         role: if role == "agent" { Role::Agent } else { Role::Viewer },
         scope: serde_json::from_str(&scope).unwrap_or_default(),
         note: r.get(5)?,
@@ -430,6 +491,23 @@ fn grant_role(role: Role) -> Role {
     if role == Role::Viewer { Role::Viewer } else { Role::Agent }
 }
 
+/// A grant names one valid account (or `"*"`, which needs the whole account), and a scope that is not empty.
+fn check_grant(account: &str, scope: &Scope) -> Result<()> {
+    if account != "*" && !crate::account::valid_id(account) {
+        return Err(StoreError::new(400, "Tài khoản Zalo không hợp lệ."));
+    }
+    if account == "*" && !scope.all {
+        return Err(StoreError::new(
+            400,
+            "Quyền cho «Tất cả tài khoản» phải là «Tất cả cuộc trò chuyện»: danh sách hội thoại và nhãn chỉ có nghĩa trong một tài khoản.",
+        ));
+    }
+    if !scope.all && scope.conversations.is_empty() && scope.labels.is_empty() {
+        return Err(StoreError::new(400, "Chọn ít nhất một cuộc trò chuyện hoặc nhãn, hoặc bật «Tất cả cuộc trò chuyện»."));
+    }
+    Ok(())
+}
+
 fn clean_scope(scope: Scope) -> Scope {
     let dedupe = |v: Vec<String>| v.into_iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect::<BTreeSet<_>>().into_iter().collect();
     if scope.all {
@@ -459,6 +537,7 @@ impl Store {
         let conn = rusqlite::Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -471,6 +550,7 @@ impl Store {
     pub fn memory() -> Self {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
         Self { conn: Mutex::new(conn) }
     }
 
@@ -723,7 +803,7 @@ impl Store {
 
     pub fn grants(&self) -> Result<Vec<Grant>> {
         let c = self.conn.lock();
-        let mut st = c.prepare("SELECT id, subject_type, subject_id, role, scope, note, created_at FROM grants ORDER BY created_at")?;
+        let mut st = c.prepare("SELECT id, subject_type, subject_id, role, scope, note, created_at, account FROM grants ORDER BY created_at")?;
         let rows = st.query_map([], grant_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -740,32 +820,29 @@ impl Store {
         }
     }
 
-    pub fn create_grant(&self, subject: Subject, role: Role, scope: Scope, note: &str) -> Result<Grant> {
+    pub fn create_grant(&self, subject: Subject, account: &str, role: Role, scope: Scope, note: &str) -> Result<Grant> {
         self.check_subject(&subject)?;
         let scope = clean_scope(scope);
-        if !scope.all && scope.conversations.is_empty() && scope.labels.is_empty() {
-            return Err(StoreError::new(400, "Chọn ít nhất một cuộc trò chuyện hoặc nhãn, hoặc bật «Tất cả cuộc trò chuyện»."));
-        }
+        check_grant(account, &scope)?;
         let id = new_id("a");
         let c = self.conn.lock();
         c.execute(
-            "INSERT INTO grants(id, subject_type, subject_id, role, scope, note, created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![id, subject.kind, subject.id, role_name(grant_role(role)), serde_json::to_string(&scope).unwrap_or_default(), note.trim(), now_ms()],
+            "INSERT INTO grants(id, subject_type, subject_id, role, scope, note, created_at, account) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, subject.kind, subject.id, role_name(grant_role(role)), serde_json::to_string(&scope).unwrap_or_default(), note.trim(), now_ms(), account],
         )?;
         drop(c);
         self.grant(&id)
     }
 
-    pub fn update_grant(&self, id: &str, role: Option<Role>, scope: Option<Scope>, note: Option<&str>) -> Result<Grant> {
+    pub fn update_grant(&self, id: &str, account: Option<&str>, role: Option<Role>, scope: Option<Scope>, note: Option<&str>) -> Result<Grant> {
         let g = self.grant(id)?;
         let scope = clean_scope(scope.unwrap_or(g.scope));
-        if !scope.all && scope.conversations.is_empty() && scope.labels.is_empty() {
-            return Err(StoreError::new(400, "Chọn ít nhất một cuộc trò chuyện hoặc nhãn, hoặc bật «Tất cả cuộc trò chuyện»."));
-        }
+        let account = account.unwrap_or(&g.account).to_owned();
+        check_grant(&account, &scope)?;
         let c = self.conn.lock();
         c.execute(
-            "UPDATE grants SET role = ?2, scope = ?3, note = ?4 WHERE id = ?1",
-            params![id, role_name(grant_role(role.unwrap_or(g.role))), serde_json::to_string(&scope).unwrap_or_default(), note.map(str::trim).unwrap_or(&g.note)],
+            "UPDATE grants SET role = ?2, scope = ?3, note = ?4, account = ?5 WHERE id = ?1",
+            params![id, role_name(grant_role(role.unwrap_or(g.role))), serde_json::to_string(&scope).unwrap_or_default(), note.map(str::trim).unwrap_or(&g.note), account],
         )?;
         drop(c);
         self.grant(id)
@@ -777,14 +854,15 @@ impl Store {
         Ok(g)
     }
 
-    /// Effective access: admins see everything; otherwise the highest role and the union of the scopes of the user's
-    /// own and their groups' grants. None = no access to the account. `via` lists the grants that count.
-    pub fn access_of(&self, user: &User) -> Result<(Option<Access>, Vec<Value>)> {
+    /// Effective access per account: admins see everything; otherwise, per account, the highest role and the union
+    /// of the scopes of the user's own and their groups' grants (`"*"` grants apply to every account). None = no
+    /// access at all. `via` lists the grants that count.
+    pub fn access_of(&self, user: &User) -> Result<(Option<UserAccess>, Vec<Value>)> {
         if user.disabled {
             return Ok((None, Vec::new()));
         }
         if user.is_admin {
-            return Ok((Some(Access { role: Role::Admin, scope: Scope { all: true, ..Default::default() } }), vec![json!({ "admin": true })]));
+            return Ok((Some(UserAccess::admin()), vec![json!({ "admin": true })]));
         }
         let groups = self.groups_of(&user.id)?;
         let grants: Vec<Grant> = self
@@ -795,21 +873,31 @@ impl Store {
         if grants.is_empty() {
             return Ok((None, Vec::new()));
         }
-        let role = grants.iter().map(|g| g.role).max().unwrap_or(Role::Viewer);
-        let all = grants.iter().any(|g| g.scope.all);
-        let mut conversations = BTreeSet::new();
-        let mut labels = BTreeSet::new();
-        if !all {
-            for g in &grants {
-                conversations.extend(g.scope.conversations.iter().cloned());
-                labels.extend(g.scope.labels.iter().cloned());
-            }
+        let mut by_account: BTreeMap<String, Vec<&Grant>> = BTreeMap::new();
+        for g in &grants {
+            by_account.entry(g.account.clone()).or_default().push(g);
         }
-        let via = grants.iter().map(|g| json!({ "grantId": g.id, "subject": g.subject, "role": g.role, "scope": g.scope })).collect();
-        Ok((
-            Some(Access { role, scope: Scope { all, conversations: conversations.into_iter().collect(), labels: labels.into_iter().collect() } }),
-            via,
-        ))
+        let accounts = by_account
+            .into_iter()
+            .map(|(account, list)| {
+                let role = list.iter().map(|g| g.role).max().unwrap_or(Role::Viewer);
+                let all = list.iter().any(|g| g.scope.all);
+                let mut conversations = BTreeSet::new();
+                let mut labels = BTreeSet::new();
+                if !all {
+                    for g in &list {
+                        conversations.extend(g.scope.conversations.iter().cloned());
+                        labels.extend(g.scope.labels.iter().cloned());
+                    }
+                }
+                (account, Access { role, scope: Scope { all, conversations: conversations.into_iter().collect(), labels: labels.into_iter().collect() } })
+            })
+            .collect();
+        let via = grants
+            .iter()
+            .map(|g| json!({ "grantId": g.id, "subject": g.subject, "account": g.account, "role": g.role, "scope": g.scope }))
+            .collect();
+        Ok((Some(UserAccess { admin: false, accounts }), via))
     }
 
     // ---- sessions ----
@@ -1122,17 +1210,52 @@ mod tests {
         assert!(s.access_of(&u).unwrap().0.is_none());
         let g = s.create_group("Sales", "", "local").unwrap();
         s.set_members(&g.id, &[u.id.clone()]).unwrap();
-        s.create_grant(Subject { kind: "user".into(), id: u.id.clone() }, Role::Viewer, scope(&["c1"], &[]), "").unwrap();
-        s.create_grant(Subject { kind: "group".into(), id: g.id.clone() }, Role::Agent, scope(&["c2"], &["l1"]), "").unwrap();
+        s.create_grant(Subject { kind: "user".into(), id: u.id.clone() }, "default", Role::Viewer, scope(&["c1"], &[]), "").unwrap();
+        s.create_grant(Subject { kind: "group".into(), id: g.id.clone() }, "default", Role::Agent, scope(&["c2"], &["l1"]), "").unwrap();
         let (access, via) = s.access_of(&u).unwrap();
-        let access = access.unwrap();
+        let access = access.unwrap().for_account("default").unwrap();
         assert_eq!(access.role, Role::Agent);
         assert_eq!(access.scope, scope(&["c1", "c2"], &["l1"]));
         assert_eq!(via.len(), 2);
-        assert_eq!(s.access_of(&admin).unwrap().0.unwrap().role, Role::Admin);
+        assert_eq!(s.access_of(&admin).unwrap().0.unwrap().for_account("a1b2c3d4e").unwrap().role, Role::Admin);
         // Deleting the group removes its grant.
         s.delete_group(&g.id).unwrap();
-        assert_eq!(s.access_of(&u).unwrap().0.unwrap().role, Role::Viewer);
+        assert_eq!(s.access_of(&u).unwrap().0.unwrap().for_account("default").unwrap().role, Role::Viewer);
+    }
+
+    #[test]
+    fn grants_are_per_account_and_star_needs_every_conversation() {
+        let s = Store::memory();
+        let u = s.create_user("an", "", "", "local", Some("h"), false).unwrap();
+        let me = || Subject { kind: "user".into(), id: u.id.clone() };
+        assert_eq!(s.create_grant(me(), "*", Role::Viewer, scope(&["c1"], &[]), "").unwrap_err().status, 400);
+        assert_eq!(s.create_grant(me(), "../x", Role::Viewer, Scope { all: true, ..Default::default() }, "").unwrap_err().status, 400);
+        s.create_grant(me(), "a1b2c3d4e", Role::Agent, scope(&["c9"], &[]), "").unwrap();
+        s.create_grant(me(), "*", Role::Viewer, Scope { all: true, ..Default::default() }, "").unwrap();
+        let access = s.access_of(&u).unwrap().0.unwrap();
+        // a1b2c3d4: agent (its own grant) with every conversation (from "*").
+        let a = access.for_account("a1b2c3d4e").unwrap();
+        assert_eq!((a.role, a.scope.all), (Role::Agent, true));
+        // Any other account: the "*" viewer grant only.
+        let d = access.for_account("default").unwrap();
+        assert_eq!((d.role, d.scope.all), (Role::Viewer, true));
+        let expanded = access.expanded(&["default".into(), "a1b2c3d4e".into()]);
+        assert_eq!(expanded["accounts"]["a1b2c3d4e"]["role"], json!("agent"));
+        // Without "*", an account without a grant is out of reach.
+        let v = s.create_user("vy", "", "", "local", Some("h"), false).unwrap();
+        s.create_grant(Subject { kind: "user".into(), id: v.id.clone() }, "a1b2c3d4e", Role::Viewer, Scope { all: true, ..Default::default() }, "").unwrap();
+        assert!(s.access_of(&v).unwrap().0.unwrap().for_account("default").is_none());
+    }
+
+    #[test]
+    fn old_grants_migrate_to_the_default_account() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&SCHEMA.replace(", account TEXT NOT NULL DEFAULT 'default'", "")).unwrap();
+        conn.execute("INSERT INTO grants(id, subject_type, subject_id, role, scope, note, created_at) VALUES('a_1','user','u','viewer','{\"all\":true}','',1)", []).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let account: String = conn.query_row("SELECT account FROM grants WHERE id = 'a_1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(account, "default");
     }
 
     #[test]

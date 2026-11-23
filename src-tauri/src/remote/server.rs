@@ -24,8 +24,8 @@ use tokio_tungstenite::tungstenite::protocol::{Role as WsRole, WebSocketConfig};
 
 use super::Remote;
 use super::http::{Conn, Head};
-use super::policy::{self, Access, CallKind, Role};
-use super::store::{Session, User};
+use super::policy::{self, CallKind, Role};
+use super::store::{Session, User, UserAccess};
 
 /// Joined apps at once.
 const MAX_SESSIONS: usize = 32;
@@ -67,7 +67,7 @@ struct Peer {
     device_name: String,
     addr: String,
     since: i64,
-    access: Arc<Mutex<Access>>,
+    access: Arc<Mutex<UserAccess>>,
     kick: mpsc::UnboundedSender<&'static str>,
     push: mpsc::UnboundedSender<String>,
 }
@@ -99,7 +99,7 @@ impl Hub {
                     "id": p.session_id, "userId": p.user_id, "username": p.username,
                     "user": { "id": p.user_id, "username": p.username, "displayName": p.display_name },
                     "kind": "device", "online": true, "ip": p.addr, "deviceId": p.device_id,
-                    "deviceName": p.device_name, "address": p.addr, "since": p.since, "role": p.access.lock().role,
+                    "deviceName": p.device_name, "address": p.addr, "since": p.since, "role": top_role(&p.access.lock()),
                 })
             })
             .collect()
@@ -120,8 +120,9 @@ impl Hub {
         }
     }
 
-    /// Re-evaluates every connected user's access (an admin changed users, groups or grants).
-    pub fn refresh_access(&self, access_of: impl Fn(&str) -> Option<Access>, snapshot: impl Fn(&Access) -> Option<Value>) {
+    /// Re-evaluates every connected user's access (an admin changed users, groups or grants): a user who lost it all
+    /// is disconnected; the others get `messages(new access)` (the access, the account list, fresh lists).
+    pub fn refresh_access(&self, access_of: impl Fn(&str) -> Option<UserAccess>, messages: impl Fn(&UserAccess) -> Vec<String>) {
         for p in self.peers.lock().iter() {
             match access_of(&p.user_id) {
                 None => {
@@ -131,9 +132,8 @@ impl Hub {
                     let mut current = p.access.lock();
                     if *current != next {
                         *current = next.clone();
-                        let _ = p.push.send(json!({ "t": "access", "access": next }).to_string());
-                        if let Some(snapshot) = snapshot(&next) {
-                            let _ = p.push.send(json!({ "t": "event", "event": "compola://state", "payload": snapshot }).to_string());
+                        for m in messages(&next) {
+                            let _ = p.push.send(m);
                         }
                     }
                 }
@@ -144,6 +144,11 @@ impl Hub {
     fn remove(&self, session_id: &str, since: i64) {
         self.peers.lock().retain(|p| !(p.session_id == session_id && p.since == since));
     }
+}
+
+/// The highest role a user has on any account (the devices list shows one).
+fn top_role(access: &UserAccess) -> Role {
+    if access.admin { Role::Admin } else { access.accounts.values().map(|a| a.role).max().unwrap_or(Role::Viewer) }
 }
 
 // ---- listener ----
@@ -259,10 +264,14 @@ async fn serve(remote: Arc<Remote>, stream: TcpStream, peer: SocketAddr) {
                     return;
                 }
                 ("GET" | "HEAD", "/media/load") => match conn.skip_body(length).await {
+                    // The account whose network / files serve it must be one the user may use.
+                    Ok(()) if access.for_account(&head.param("account").unwrap_or_else(|| crate::account::DEFAULT_ID.into())).is_none() => {
+                        conn.respond_json(403, &json!({ "error": "Bạn không có quyền với tài khoản Zalo này." }), close).await
+                    }
                     Ok(()) => media(&remote, &mut conn, &head, close).await,
                     Err(e) => Err(e),
                 },
-                ("POST", "/upload") if access.role >= Role::Agent => upload(&mut conn, &head, length, close).await,
+                ("POST", "/upload") if top_role(&access) >= Role::Agent => upload(&mut conn, &head, length, close).await,
                 ("POST", "/upload") => {
                     let _ = conn.respond_json(403, &json!({ "error": "Bạn chỉ có quyền xem." }), true).await;
                     return;
@@ -282,7 +291,7 @@ async fn serve(remote: Arc<Remote>, stream: TcpStream, peer: SocketAddr) {
 /// The session of a joined app (bearer device token) or of the web client (the console's cookie). A cookie is only
 /// accepted from this server's own pages: same `Origin` (WebSocket, uploads), and uploads also need `X-Compola: 1`;
 /// plain media GETs rely on the cookie's SameSite=Lax.
-fn device_session(remote: &Remote, head: &Head, ip: &str) -> Option<(Session, User, Access)> {
+fn device_session(remote: &Remote, head: &Head, ip: &str) -> Option<(Session, User, UserAccess)> {
     let auth = remote.auth()?;
     let (session, user) = if let Some(token) = head.bearer() {
         let (s, u) = auth.store.session_by_token(token, ip, Some(super::auth::DEVICE_TTL_MS)).ok()??;
@@ -449,7 +458,7 @@ async fn upload(conn: &mut Conn, head: &Head, length: u64, close: bool) -> std::
 
 // ---- WebSocket session ----
 
-async fn upgrade(remote: Arc<Remote>, mut conn: Conn, head: Head, ip: String, session: Session, user: User, access: Access) {
+async fn upgrade(remote: Arc<Remote>, mut conn: Conn, head: Head, ip: String, session: Session, user: User, access: UserAccess) {
     let Some(key) = head.header("sec-websocket-key") else {
         let _ = conn.respond_json(400, &json!({ "error": "Sec-WebSocket-Key" }), true).await;
         return;
@@ -472,10 +481,10 @@ struct Who {
     user: User,
     session: Session,
     ip: String,
-    access: Arc<Mutex<Access>>,
+    access: Arc<Mutex<UserAccess>>,
 }
 
-async fn session_loop(remote: Arc<Remote>, ws: WebSocketStream<TcpStream>, ip: String, session: Session, user: User, access: Access) {
+async fn session_loop(remote: Arc<Remote>, ws: WebSocketStream<TcpStream>, ip: String, session: Session, user: User, access: UserAccess) {
     let (mut sink, mut source) = ws.split();
     let mut events = remote.hub.tx.subscribe();
     let (kick_tx, mut kick_rx) = mpsc::unbounded_channel();
@@ -499,20 +508,22 @@ async fn session_loop(remote: Arc<Remote>, ws: WebSocketStream<TcpStream>, ip: S
     remote.changed();
     let who = Arc::new(Who { user: user.clone(), session: session.clone(), ip: ip.clone(), access: shared_access.clone() });
 
+    let mut sent_accounts = remote.accounts_for(&access);
     let hello = json!({
         "t": "hello",
         "server": { "name": remote.server_name(), "version": version() },
         "user": user.brief(),
-        "access": access,
+        "access": access.expanded(&remote.account_ids()),
+        "accounts": sent_accounts,
     });
+    let mut accounts_tick = tokio::time::interval(Duration::from_secs(3));
     let mut alive = sink.send(Message::text(hello.to_string())).await.is_ok();
     let mut ping = tokio::time::interval(PING_EVERY);
     let mut last_seen = Instant::now();
     let mut bye: Option<&'static str> = None;
-    // filter_event is stateless: when label membership or this user's access changes, the conversation list is sent
-    // again whole, so conversations that left the scope disappear from it.
-    let mut seen_generation = remote.mirror.read().generation();
-    let mut seen_access = access.clone();
+    // filter_event is stateless: when an account's label membership changes, its conversation list is sent again
+    // whole, so conversations that left the scope disappear from it (access changes: `Hub::refresh_access`).
+    let mut seen_generation: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     while alive {
         tokio::select! {
             incoming = source.next() => match incoming {
@@ -525,24 +536,23 @@ async fn session_loop(remote: Arc<Remote>, ws: WebSocketStream<TcpStream>, ip: S
             },
             event = events.recv() => match event {
                 Ok(b) => {
-                    let current = shared_access.lock().clone();
-                    let resync = {
-                        let mirror = remote.mirror.read();
+                    let account = b.payload.get("account").and_then(Value::as_str).unwrap_or(crate::account::DEFAULT_ID).to_owned();
+                    let Some(current) = shared_access.lock().for_account(&account) else { continue };
+                    let (resync, filtered) = remote.with_mirror(&account, |mirror| {
                         let generation = mirror.generation();
-                        let stale = generation != seen_generation || current != seen_access;
-                        seen_generation = generation;
-                        seen_access = current.clone();
-                        stale.then(|| mirror.conversations_snapshot(&current)).flatten()
-                    };
-                    if let Some(snapshot) = resync {
-                        let text = json!({ "t": "event", "event": "compola://state", "payload": snapshot }).to_string();
+                        let stale = seen_generation.insert(account.clone(), generation).is_some_and(|g| g != generation);
+                        let resync = stale.then(|| mirror.conversations_snapshot(&current)).flatten();
+                        (resync, filter_tagged(&current, mirror, &b.event, &b.payload, &account))
+                    });
+                    if let Some(mut snapshot) = resync {
+                        snapshot["account"] = json!(account);
+                        let text = json!({ "t": "event", "account": account, "event": "compola://state", "payload": snapshot }).to_string();
                         if sink.send(Message::text(text)).await.is_err() {
                             break;
                         }
                     }
-                    let filtered = policy::filter_event(&current, &remote.mirror.read(), &b.event, &b.payload);
                     if let Some(payload) = filtered {
-                        let text = json!({ "t": "event", "event": &*b.event, "payload": payload }).to_string();
+                        let text = json!({ "t": "event", "account": account, "event": &*b.event, "payload": payload }).to_string();
                         alive = sink.send(Message::text(text)).await.is_ok();
                     }
                 }
@@ -557,6 +567,14 @@ async fn session_loop(remote: Arc<Remote>, ws: WebSocketStream<TcpStream>, ip: S
             reason = kick_rx.recv() => {
                 bye = Some(reason.unwrap_or("closed"));
                 break;
+            }
+            // Accounts added, removed, signed in or out, renamed on the host: the user's list follows.
+            _ = accounts_tick.tick() => {
+                let now = remote.accounts_for(&shared_access.lock().clone());
+                if now != sent_accounts {
+                    sent_accounts = now.clone();
+                    alive = sink.send(Message::text(json!({ "t": "accounts", "accounts": now }).to_string())).await.is_ok();
+                }
             }
             _ = ping.tick() => {
                 if last_seen.elapsed() > IDLE {
@@ -573,6 +591,23 @@ async fn session_loop(remote: Arc<Remote>, ws: WebSocketStream<TcpStream>, ip: S
     remote.hub.remove(&session.id, since);
     log::info!("compola server: {} left «{}»", user.username, session.device_name);
     remote.changed();
+}
+
+/// `filter_event` for an account-tagged payload: `badge` `{account, count}` is filtered as its count, and the
+/// filtered payload keeps its `account`.
+fn filter_tagged(access: &policy::Access, mirror: &policy::Mirror, event: &str, payload: &Value, account: &str) -> Option<Value> {
+    if event == "compola://badge" {
+        if let Some(count) = payload.get("count") {
+            return policy::filter_event(access, mirror, event, count).map(|c| json!({ "account": account, "count": c }));
+        }
+    }
+    let mut out = policy::filter_event(access, mirror, event, payload)?;
+    if payload.get("account").is_some() {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("account".into(), json!(account));
+        }
+    }
+    Some(out)
 }
 
 fn handle_text(remote: &Arc<Remote>, who: &Arc<Who>, text: &str, out: &mpsc::UnboundedSender<String>) {
@@ -606,15 +641,15 @@ fn audit(remote: &Remote, who: &Who, action: &str, target: &str, detail: Value) 
 
 /// One invoke of a joined user: the policy decides, the engine runs it, read results are filtered.
 async fn dispatch(remote: &Remote, who: &Who, cmd: &str, args: &Value) -> Result<Value, String> {
-    let access = who.access.lock().clone();
+    let user_access = who.access.lock().clone();
     let text = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
     let list = |k: &str| args.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
     let target_method = format!("{}.{}", text("target"), text("method"));
+    // The account: `args.account` (the user's first account when missing); everything below is that account's.
+    let account = remote.account_for_invoke(&user_access, args.get("account").and_then(Value::as_str))?;
+    let access = user_access.for_account(&account).ok_or("Bạn không có quyền với tài khoản Zalo này.")?;
 
-    let (kind, described) = {
-        let mirror = remote.mirror.read();
-        (policy::check_call(&access, &mirror, cmd, args), policy::describe_call(&mirror, cmd, args))
-    };
+    let (kind, described) = remote.with_mirror(&account, |mirror| (policy::check_call(&access, mirror, cmd, args), policy::describe_call(mirror, cmd, args)));
     let kind = match kind {
         Ok(k) => k,
         Err(reason) => {
@@ -623,13 +658,13 @@ async fn dispatch(remote: &Remote, who: &Who, cmd: &str, args: &Value) -> Result
         }
     };
 
-    let engine = remote.engine().ok_or("engine not running")?;
+    let engine = crate::account::engine(&remote.app, Some(&account))?;
     let result = match cmd {
         "engine_phase" => serde_json::to_value(engine.phase()).map_err(|e| e.to_string()),
         "engine_info" => Ok(engine.info()),
         "engine_replay" => {
-            let mirror = remote.mirror.read();
-            let events = engine.replay().into_iter().filter_map(|e| policy::filter_event(&access, &mirror, "compola://state", &e)).collect();
+            let replay = engine.replay();
+            let events = remote.with_mirror(&account, |mirror| replay.into_iter().filter_map(|e| policy::filter_event(&access, mirror, "compola://state", &e)).collect());
             Ok(Value::Array(events))
         }
         "engine_call" => {
@@ -655,7 +690,7 @@ async fn dispatch(remote: &Remote, who: &Who, cmd: &str, args: &Value) -> Result
             engine.retry_runtime_setup();
             Ok(Value::Null)
         }
-        "automation_search" | "automation_search_status" | "automation_conversations" | "automation_messages" => automation(remote, cmd, args).await,
+        "automation_search" | "automation_search_status" | "automation_conversations" | "automation_messages" => automation(remote, &account, cmd, args).await,
         _ => Err(format!("Lệnh «{cmd}» không dùng được khi kết nối qua Compola Server.")),
     };
     // Who did what on the Zalo account (docs: "Activity tracking"); administration stays in the audit log.
@@ -667,34 +702,39 @@ async fn dispatch(remote: &Remote, who: &Who, cmd: &str, args: &Value) -> Result
             device_name: who.session.device_name.clone(),
             device_kind: device_kind.into(),
         };
-        remote.record_activity(actor, info, &target_method, result.is_ok());
+        remote.record_activity(actor, &account, info, &target_method, result.is_ok());
     } else if kind == CallKind::Write {
         audit(remote, who, &format!("call.{target_method}"), "", json!({ "ok": result.is_ok() }));
     }
     let result = result?;
     // Undo ids, group members, mention candidates… the policy needs to check later calls.
     if cmd == "engine_call" || cmd == "engine_call_with_files" {
-        remote.mirror.write().observe_result(cmd, args, &result);
+        remote.with_mirror_mut(&account, |m| m.observe_result(cmd, args, &result));
     }
     if kind == CallKind::Read {
-        let mirror = remote.mirror.read();
-        return Ok(policy::filter_result(&access, &mirror, cmd, args, result));
+        return Ok(remote.with_mirror(&account, |mirror| policy::filter_result(&access, mirror, cmd, args, result)));
     }
     Ok(result)
 }
 
-async fn automation(remote: &Remote, cmd: &str, args: &Value) -> Result<Value, String> {
+async fn automation(remote: &Remote, account: &str, cmd: &str, args: &Value) -> Result<Value, String> {
     use tauri::Manager;
     let a = remote.app.try_state::<Arc<crate::automation::Automation>>().map(|s| s.inner().clone()).ok_or("automation not running")?;
     let text = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_owned).filter(|s| !s.is_empty());
     let num = |k: &str, d: u64| args.get(k).and_then(Value::as_u64).unwrap_or(d) as usize;
+    // The invoke's account, resolved and access-checked by `dispatch` (`default` while forwarding is off, §7).
+    let account = if crate::account::server_multi_account() { Some(account) } else { Some(crate::account::DEFAULT_ID) };
     match cmd {
         "automation_search" => {
-            a.search_messages(&text("query").unwrap_or_default(), text("conversationId"), num("limit", 30).clamp(1, 200), num("context", 0).min(10)).await
+            a.search_messages(account, &text("query").unwrap_or_default(), text("conversationId"), num("limit", 30).clamp(1, 200), num("context", 0).min(10)).await
         }
-        "automation_search_status" => Ok(a.search_status_json()),
-        "automation_conversations" => serde_json::to_value(a.find_conversations(text("query").as_deref(), num("limit", 50), false)).map_err(|e| e.to_string()),
-        "automation_messages" => serde_json::to_value(a.recent_messages(text("conversationId").as_deref(), num("limit", 50))).map_err(|e| e.to_string()),
+        "automation_search_status" => Ok(a.search_status_json(account)),
+        "automation_conversations" => a
+            .find_conversations(account, text("query").as_deref(), num("limit", 50), false)
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
+        "automation_messages" => a
+            .recent_messages(account, text("conversationId").as_deref(), num("limit", 50))
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
         _ => Err("unknown".into()),
     }
 }

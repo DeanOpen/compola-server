@@ -15,7 +15,6 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
-use super::policy::Access;
 use super::{DEFAULT_PORT, EVENT, JoinConfig, NOTIFICATION_EVENT};
 
 const NOT_CONNECTED: &str = "Chưa kết nối được tới Compola Server.";
@@ -227,7 +226,15 @@ pub struct Status {
     pub device_id: String,
     /// The server user this app is signed in as.
     pub user: Option<Value>,
-    pub access: Option<Access>,
+    /// `{admin, accounts: {<id>: {role, scope}}}` (docs/compola-server.md, "Multiple Zalo accounts").
+    pub access: Option<Value>,
+    /// The server's accounts this user may use: `{active, maxAccounts, accounts: [summary…]}` (`active` = this app's
+    /// own choice, see `active_account`).
+    pub accounts: Option<Value>,
+    /// The account this app's UI shows (local: choosing one does not change the host).
+    pub active_account: String,
+    /// `active`: only the active account's screen events reach the UI; `all`: every account's.
+    pub event_scope: String,
 }
 
 pub struct Client {
@@ -262,6 +269,9 @@ impl Client {
             device_id,
             user: Some(json!({ "username": join.username, "displayName": join.display_name })),
             access: None,
+            accounts: None,
+            active_account: crate::account::DEFAULT_ID.to_owned(),
+            event_scope: "active".into(),
         };
         Ok(Arc::new(Self {
             app,
@@ -437,7 +447,8 @@ impl Client {
             Some("hello") => {
                 let name = msg.pointer("/server/name").and_then(Value::as_str).unwrap_or_default().to_owned();
                 let user = msg.get("user").cloned();
-                let access: Option<Access> = msg.get("access").and_then(|a| serde_json::from_value(a.clone()).ok());
+                let access = msg.get("access").cloned();
+                self.set_accounts(msg.get("accounts").cloned());
                 self.update(|s| {
                     s.user = user.or(s.user.take());
                     s.access = access;
@@ -465,6 +476,16 @@ impl Client {
             Some("event") => {
                 let event = msg.get("event").and_then(Value::as_str).unwrap_or_default();
                 let payload = msg.get("payload").cloned().unwrap_or(Value::Null);
+                // Another account's screen events only reach a UI that asked for every account (§6).
+                let account = msg.get("account").and_then(Value::as_str).unwrap_or(crate::account::DEFAULT_ID);
+                let scoped = matches!(event, "compola://state" | "compola://phase" | "compola://page" | "compola://log");
+                let (active, scope) = {
+                    let st = self.status.lock();
+                    (st.active_account.clone(), st.event_scope.clone())
+                };
+                if scoped && scope != "all" && account != active {
+                    return None;
+                }
                 if event == NOTIFICATION_EVENT {
                     self.notify(&payload);
                 } else if event.starts_with("compola://") {
@@ -472,12 +493,13 @@ impl Client {
                 }
             }
             Some("access") => {
-                let access: Option<Access> = msg.get("access").and_then(|a| serde_json::from_value(a.clone()).ok());
-                if let Some(access) = access {
+                if let Some(access) = msg.get("access").cloned() {
                     self.update(|s| s.access = Some(access.clone()));
+                    self.set_accounts(msg.get("accounts").cloned());
                     let _ = self.app.emit_to("main", EVENT, json!({ "kind": "access", "access": access }));
                 }
             }
+            Some("accounts") => self.set_accounts(msg.get("accounts").cloned()),
             Some("bye") => {
                 return Some(match msg.get("reason").and_then(Value::as_str) {
                     Some("kicked" | "revoked") => "Quản trị viên đã thu hồi phiên đăng nhập hoặc quyền của bạn.".into(),
@@ -510,7 +532,77 @@ impl Client {
         }
     }
 
+    // ---- accounts (the joined app's switcher) ----
+
+    /// The server sent the user's accounts: keep this app's active one when it is still there, else take the first.
+    fn set_accounts(&self, accounts: Option<Value>) {
+        let Some(accounts) = accounts else { return };
+        let ids: Vec<String> = accounts
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_owned)).collect())
+            .unwrap_or_default();
+        let changed_active = {
+            let mut st = self.status.lock();
+            let before = st.active_account.clone();
+            if !ids.contains(&st.active_account) {
+                st.active_account = accounts.get("active").and_then(Value::as_str).map(str::to_owned).or_else(|| ids.first().cloned()).unwrap_or(before.clone());
+            }
+            st.accounts = Some(accounts);
+            st.active_account != before
+        };
+        let _ = self.app.emit_to("main", "compola://accounts", json!({ "kind": "changed", "list": self.accounts_list() }));
+        if changed_active {
+            let active = self.status.lock().active_account.clone();
+            let _ = self.app.emit_to("main", "compola://accounts", json!({ "kind": "active", "account": active }));
+        }
+    }
+
+    /// `accounts_list` in a joined app: the server's accounts this user may use, with this app's active one.
+    pub fn accounts_list(&self) -> Value {
+        let st = self.status.lock();
+        let mut list = st.accounts.clone().unwrap_or_else(|| json!({ "maxAccounts": 1, "accounts": [] }));
+        let active = st.active_account.clone();
+        list["active"] = json!(active);
+        if let Some(arr) = list.get_mut("accounts").and_then(Value::as_array_mut) {
+            for a in arr {
+                let is_active = a.get("id").and_then(Value::as_str) == Some(active.as_str());
+                a["active"] = json!(is_active);
+            }
+        }
+        list
+    }
+
+    /// `account_set_active` in a joined app: local only (which account this UI shows and talks to).
+    pub fn set_active_account(&self, account: &str) -> Result<(), String> {
+        let known = self.accounts_list()["accounts"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x.get("id").and_then(Value::as_str) == Some(account)));
+        if !known {
+            return Err("Tài khoản không tồn tại".into());
+        }
+        self.status.lock().active_account = account.to_owned();
+        let _ = self.app.emit_to("main", "compola://accounts", json!({ "kind": "active", "account": account }));
+        let _ = self.app.emit_to("main", "compola://accounts", json!({ "kind": "changed", "list": self.accounts_list() }));
+        Ok(())
+    }
+
+    pub fn set_event_scope(&self, scope: &str) -> Result<(), String> {
+        if scope != "all" && scope != "active" {
+            return Err("scope: all | active".into());
+        }
+        self.status.lock().event_scope = scope.to_owned();
+        Ok(())
+    }
+
     pub async fn invoke(&self, cmd: &str, args: Value) -> Result<Value, String> {
+        // Engine and search commands without an account act on the account this app shows.
+        let mut args = args;
+        if (cmd.starts_with("engine_") || cmd.starts_with("automation_")) && args.get("account").and_then(Value::as_str).is_none_or(str::is_empty) {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("account".into(), json!(self.status.lock().active_account.clone()));
+            }
+        }
         self.wait_connected(Some(Duration::from_secs(20))).await?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();

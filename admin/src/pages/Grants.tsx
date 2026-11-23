@@ -3,11 +3,12 @@ import { useRoute } from '../router';
 import { DataTable, type Column } from '../table';
 import { Eye, Globe2, MessagesSquare, Pencil, Plus, ShieldCheck, Tag, Trash2, User as UserIcon, Users as UsersIcon } from 'lucide-react';
 import { api } from '../api';
-import { effective, scopeCovers, whoSees } from '../access';
+import { ALL_ACCOUNTS, accountName, effective, grantAccount, scopeCovers, whoSees } from '../access';
+import { AccountChip } from '../accountsView';
 import { formatDateTime, ROLE_HINT, roleLabel, scopeSummary } from '../format';
 import { useLoad } from '../hooks';
 import { confirmDialog, toast, toastError } from '../store';
-import type { AccountData, Conversation, EffectiveAccess, Grant, Group, Label, Role, Scope, Subject, User } from '../types';
+import type { AccountData, Conversation, EffectiveAccess, Grant, Group, Role, Scope, Subject, User, ZaloAccount } from '../types';
 import {
   Avatar,
   Badge,
@@ -40,32 +41,45 @@ const ROLE_ROWS: { value: Role | 'admin'; label: string; description: string; ic
   { value: 'admin', label: 'Quản trị viên', description: 'Quản lý máy chủ và thấy mọi cuộc trò chuyện. Không cấp ở đây: bật ở Người dùng → Sửa thông tin.', icon: <ShieldCheck size={16} /> },
 ];
 
+const EMPTY_DATA: AccountData = { conversations: [], labels: [] };
+
 interface Ctx {
   users: User[];
   groups: Group[];
-  account: AccountData;
-  accountError: string | null;
   userById: Map<string, User>;
   groupById: Map<string, Group>;
-  convById: Map<string, Conversation>;
-  labelById: Map<string, Label>;
+  /** The host's Zalo accounts in order (M5); a server without the accounts API shows just "default". */
+  accounts: ZaloAccount[];
+  accountById: Map<string, ZaloAccount>;
+  /** More than one account: show account columns and pickers. */
+  multi: boolean;
+  /** Conversations and labels per account. */
+  data: Map<string, AccountData>;
+  dataError: string | null;
 }
 
-function useCtx(users: User[] | undefined, groups: Group[] | undefined, account: AccountData | undefined, accountError: unknown): Ctx {
+const PSEUDO_DEFAULT: ZaloAccount = { id: 'default', uid: '', name: '', label: '', avatar: '', order: 0, enabled: true, active: true, phase: 'ready', badge: 0 };
+
+function useCtx(users: User[] | undefined, groups: Group[] | undefined, accounts: ZaloAccount[] | undefined, data: Map<string, AccountData> | undefined, dataError: unknown): Ctx {
   return useMemo(() => {
-    const acc = account ?? { conversations: [], labels: [] };
+    const accs = accounts?.length ? accounts : [PSEUDO_DEFAULT];
     return {
       users: users ?? [],
       groups: groups ?? [],
-      account: acc,
-      accountError: accountError ? (accountError instanceof Error ? accountError.message : String(accountError)) : null,
       userById: new Map((users ?? []).map((u) => [u.id, u])),
       groupById: new Map((groups ?? []).map((g) => [g.id, g])),
-      convById: new Map(acc.conversations.map((c) => [c.id, c])),
-      labelById: new Map(acc.labels.map((l) => [l.id, l])),
+      accounts: accs,
+      accountById: new Map(accs.map((a) => [a.id, a])),
+      multi: accs.length > 1,
+      data: data ?? new Map(),
+      dataError: dataError ? (dataError instanceof Error ? dataError.message : String(dataError)) : null,
     };
-  }, [users, groups, account, accountError]);
+  }, [users, groups, accounts, data, dataError]);
 }
+
+const dataOf = (ctx: Ctx, account: string) => ctx.data.get(account) ?? EMPTY_DATA;
+const convOf = (ctx: Ctx, account: string, id: string) => dataOf(ctx, account).conversations.find((c) => c.id === id);
+const labelOf = (ctx: Ctx, account: string, id: string) => dataOf(ctx, account).labels.find((l) => l.id === id);
 
 function subjectName(s: Subject, ctx: Ctx): string {
   if (s.type === 'user') {
@@ -102,15 +116,15 @@ function RoleBadge({ role }: { role: Role | 'admin' | string | null }) {
   return <Badge tone={role === 'admin' ? 'accent' : role === 'agent' ? 'ok' : role === 'viewer' ? 'neutral' : 'warn'}>{roleLabel(role as Role)}</Badge>;
 }
 
-function ScopeCell({ scope, ctx, max = 3 }: { scope: Scope; ctx: Ctx; max?: number }) {
+function ScopeCell({ scope, ctx, account, max = 3 }: { scope: Scope; ctx: Ctx; account: string; max?: number }) {
   if (scope.all)
     return (
       <Badge tone="info">
         <Globe2 size={12} /> Tất cả cuộc trò chuyện
       </Badge>
     );
-  const convs = scope.conversations.map((id) => ctx.convById.get(id) ?? { id, name: id, isGroup: false, avatar: '', labels: [] });
-  const labels = scope.labels.map((id) => ctx.labelById.get(id) ?? { id, name: id, color: '' });
+  const convs = scope.conversations.map((id) => convOf(ctx, account, id) ?? { id, name: id, isGroup: false, avatar: '', labels: [] });
+  const labels = scope.labels.map((id) => labelOf(ctx, account, id) ?? { id, name: id, color: '' });
   if (!convs.length && !labels.length) return <span className="tertiary">Không có</span>;
   const extra = Math.max(0, convs.length - max);
   return (
@@ -133,8 +147,18 @@ export function GrantsPage() {
   const grants = useLoad(() => api.grants(), []);
   const users = useLoad(() => api.users(), []);
   const groups = useLoad(() => api.groups(), []);
-  const account = useLoad(() => api.accountData(), []);
-  const ctx = useCtx(users.data, groups.data, account.data, account.error);
+  const accounts = useLoad(() => api.accounts().then((r) => r.accounts).catch(() => [] as ZaloAccount[]), []);
+  // Conversations and labels of every account (one request each), for names in the list and the pickers.
+  const accountIds = (accounts.data?.length ? accounts.data : [PSEUDO_DEFAULT]).map((a) => a.id).join(',');
+  const data = useLoad(
+    async () => {
+      const ids = accountIds.split(',');
+      const all = await Promise.all(ids.map((id) => api.accountData(id === 'default' && ids.length === 1 ? undefined : id)));
+      return new Map(ids.map((id, i) => [id, all[i]]));
+    },
+    [accountIds],
+  );
+  const ctx = useCtx(users.data, groups.data, accounts.data, data.data, data.error);
   const route = useRoute();
   const linkedUser = route.query.get('user');
   const linkedGroup = route.query.get('group');
@@ -148,7 +172,7 @@ export function GrantsPage() {
     <div className="page">
       <PageHeader
         title="Phân quyền"
-        subtitle="Ai được dùng tài khoản Zalo này, với vai trò nào và trong những cuộc trò chuyện nào"
+        subtitle={ctx.multi ? 'Ai được dùng tài khoản Zalo nào, với vai trò nào và trong những cuộc trò chuyện nào' : 'Ai được dùng tài khoản Zalo này, với vai trò nào và trong những cuộc trò chuyện nào'}
         actions={
           <Button variant="primary" icon={<Plus size={16} />} onClick={() => setEditing('new')}>
             Cấp quyền
@@ -166,9 +190,9 @@ export function GrantsPage() {
           ]}
         />
       </div>
-      {ctx.accountError && tab !== 'user' && (
+      {ctx.dataError && tab !== 'user' && (
         <div className="notice notice-warn">
-          <span>Chưa lấy được danh sách cuộc trò chuyện của tài khoản Zalo ({ctx.accountError}). Tên cuộc trò chuyện sẽ hiện dưới dạng mã.</span>
+          <span>Chưa lấy được danh sách cuộc trò chuyện của tài khoản Zalo ({ctx.dataError}). Tên cuộc trò chuyện sẽ hiện dưới dạng mã.</span>
         </div>
       )}
       <Loadable state={grants}>
@@ -201,14 +225,15 @@ function GrantList({ grants, ctx, onEdit, onChanged, initialQuery = '' }: { gran
   const [q, setQ] = useState(initialQuery);
   useEffect(() => setQ(initialQuery), [initialQuery]);
   const [role, setRole] = useState<'' | Role>('');
+  const [account, setAccount] = useState<string | null>(null);
   const shown = grants
-    .filter((g) => (!role || g.role === role) && (!q.trim() || `${subjectName(g.subject, ctx)} ${g.note}`.toLowerCase().includes(q.trim().toLowerCase())))
+    .filter((g) => (!role || g.role === role) && (!account || grantAccount(g) === account) && (!q.trim() || `${subjectName(g.subject, ctx)} ${g.note}`.toLowerCase().includes(q.trim().toLowerCase())))
     .sort((a, b) => subjectName(a.subject, ctx).localeCompare(subjectName(b.subject, ctx)));
 
   const remove = async (g: Grant) => {
     const ok = await confirmDialog({
       title: 'Thu hồi quyền này?',
-      message: `${subjectName(g.subject, ctx)} sẽ mất quyền ${roleLabel(g.role).toLowerCase()} (${scopeSummary(g.scope).toLowerCase()}) ngay lập tức.`,
+      message: `${subjectName(g.subject, ctx)} sẽ mất quyền ${roleLabel(g.role).toLowerCase()} (${scopeSummary(g.scope).toLowerCase()}) trên ${accountName(ctx.accountById.get(grantAccount(g)), grantAccount(g))} ngay lập tức.`,
       confirmLabel: 'Thu hồi',
       danger: true,
     });
@@ -231,8 +256,19 @@ function GrantList({ grants, ctx, onEdit, onChanged, initialQuery = '' }: { gran
 
   const columns: Column<Grant>[] = [
     { key: 'subject', header: 'Đối tượng', render: (g) => <SubjectCell subject={g.subject} ctx={ctx} /> },
+    ...(ctx.multi || grants.some((g) => grantAccount(g) !== 'default')
+      ? [
+          {
+            key: 'account',
+            header: 'Tài khoản Zalo',
+            width: 190,
+            sort: (g: Grant) => (grantAccount(g) === ALL_ACCOUNTS ? '' : accountName(ctx.accountById.get(grantAccount(g)), grantAccount(g))),
+            render: (g: Grant) => <AccountChip id={grantAccount(g)} account={ctx.accountById.get(grantAccount(g))} />,
+          } as Column<Grant>,
+        ]
+      : []),
     { key: 'role', header: 'Vai trò', width: 130, sort: (g) => g.role, render: (g) => <RoleBadge role={g.role} /> },
-    { key: 'scope', header: 'Phạm vi', className: 'col-scope', render: (g) => <ScopeCell scope={g.scope} ctx={ctx} /> },
+    { key: 'scope', header: 'Phạm vi', className: 'col-scope', render: (g) => <ScopeCell scope={g.scope} ctx={ctx} account={grantAccount(g)} /> },
     {
       key: 'note',
       header: 'Ghi chú',
@@ -276,6 +312,14 @@ function GrantList({ grants, ctx, onEdit, onChanged, initialQuery = '' }: { gran
             ]}
             onChange={(v) => setRole((v ?? '') as '' | Role)}
           />
+          {ctx.multi && (
+            <FilterChip
+              label="Tài khoản"
+              value={account}
+              options={[{ value: ALL_ACCOUNTS, label: 'Tất cả tài khoản (*)' }, ...ctx.accounts.map((a) => ({ value: a.id, label: accountName(a) }))]}
+              onChange={setAccount}
+            />
+          )}
         </>
       }
       count={`${shown.length} quyền`}
@@ -284,11 +328,12 @@ function GrantList({ grants, ctx, onEdit, onChanged, initialQuery = '' }: { gran
   );
 }
 
-function conversationItems(ctx: Ctx): PickItem[] {
-  return ctx.account.conversations.map((c) => ({
+function conversationItems(ctx: Ctx, account: string): PickItem[] {
+  const d = dataOf(ctx, account);
+  return d.conversations.map((c) => ({
     id: c.id,
     label: c.name || c.id,
-    sub: [c.isGroup ? 'Nhóm' : 'Cá nhân', ...c.labels.map((l) => ctx.labelById.get(l)?.name).filter(Boolean)].join(' · '),
+    sub: [c.isGroup ? 'Nhóm' : 'Cá nhân', ...c.labels.map((l) => d.labels.find((x) => x.id === l)?.name).filter(Boolean)].join(' · '),
     avatar: c.avatar,
     group: c.isGroup,
   }));
@@ -298,6 +343,8 @@ function GrantEditor({ grant, ctx, onClose, onDone }: { grant: Grant | null; ctx
   const [subjectType, setSubjectType] = useState<Subject['type']>(grant?.subject.type ?? 'user');
   const [subjectId, setSubjectId] = useState<string | null>(grant?.subject.id ?? null);
   const [role, setRole] = useState<Role>(grant?.role ?? 'agent');
+  // The account comes first: conversations and labels belong to one account. "*" = every account (forces all).
+  const [account, setAccount] = useState<string>(grant ? grantAccount(grant) : ctx.multi ? '' : 'default');
   const [all, setAll] = useState(grant?.scope.all ?? false);
   const [conversations, setConversations] = useState<string[]>(grant?.scope.conversations ?? []);
   const [labels, setLabels] = useState<string[]>(grant?.scope.labels ?? []);
@@ -312,21 +359,35 @@ function GrantEditor({ grant, ctx, onClose, onDone }: { grant: Grant | null; ctx
         : ctx.groups.map((g) => ({ id: g.id, label: g.name, sub: `${g.members.length} thành viên`, group: true })),
     [subjectType, ctx],
   );
-  const convItems = useMemo(() => conversationItems(ctx), [ctx]);
+  const everyAccount = account === ALL_ACCOUNTS;
+  const scoped = !!account && !everyAccount;
+  const accData = scoped ? dataOf(ctx, account) : EMPTY_DATA;
+  const convItems = useMemo(() => (scoped ? conversationItems(ctx, account) : []), [ctx, account, scoped]);
   // Conversations known to the editor that this scope reaches (directly or through a label).
   const covered = useMemo(
-    () => (all ? ctx.account.conversations.length : ctx.account.conversations.filter((c) => scopeCovers({ all, conversations, labels }, c)).length),
-    [all, conversations, labels, ctx],
+    () => (all ? accData.conversations.length : accData.conversations.filter((c) => scopeCovers({ all, conversations, labels }, c)).length),
+    [all, conversations, labels, accData],
   );
-  const unknownConvs = conversations.filter((id) => !ctx.convById.has(id));
+  const unknownConvs = conversations.filter((id) => !accData.conversations.some((c) => c.id === id));
+  const pickAccount = (id: string) => {
+    if (id === account) return;
+    setAccount(id);
+    // Conversation and label ids belong to one account.
+    setConversations([]);
+    setLabels([]);
+    if (id === ALL_ACCOUNTS) setAll(true);
+  };
 
   const submit = async () => {
+    if (!account) throw new Error('Chọn tài khoản Zalo.');
     if (!subjectId) throw new Error(subjectType === 'user' ? 'Chọn người dùng.' : 'Chọn nhóm.');
-    if (!all && !conversations.length && !labels.length) throw new Error('Chọn ít nhất một cuộc trò chuyện hoặc nhãn, hoặc bật “Tất cả cuộc trò chuyện”.');
+    const allScope = all || everyAccount;
+    if (!allScope && !conversations.length && !labels.length) throw new Error('Chọn ít nhất một cuộc trò chuyện hoặc nhãn, hoặc bật “Tất cả cuộc trò chuyện”.');
     const body = {
       subject: { type: subjectType, id: subjectId },
+      account,
       role,
-      scope: all ? { all: true, conversations: [], labels: [] } : { all: false, conversations, labels },
+      scope: allScope ? { all: true, conversations: [], labels: [] } : { all: false, conversations, labels },
       note: note.trim(),
     };
     if (grant) await api.updateGrant(grant.id, body);
@@ -339,6 +400,19 @@ function GrantEditor({ grant, ctx, onClose, onDone }: { grant: Grant | null; ctx
 
   return (
     <FormModal title={grant ? 'Sửa quyền' : 'Cấp quyền'} onClose={onClose} onSubmit={submit} submitLabel={grant ? 'Lưu' : 'Cấp quyền'} wide>
+      {ctx.multi && (
+        <Field group label="Tài khoản Zalo" hint="Mỗi tài khoản có danh sách cuộc trò chuyện và nhãn riêng, nên chọn tài khoản trước.">
+          <div className="account-options" role="radiogroup">
+            {[{ id: ALL_ACCOUNTS }, ...ctx.accounts].map((a) => (
+              <label key={a.id} className={cx('account-option', account === a.id && 'is-active')}>
+                <input type="radio" name="account" checked={account === a.id} onChange={() => pickAccount(a.id)} />
+                <AccountChip id={a.id} account={a.id === ALL_ACCOUNTS ? null : (a as ZaloAccount)} size={24} />
+                {a.id === ALL_ACCOUNTS && <span className="secondary small">kể cả tài khoản thêm sau</span>}
+              </label>
+            ))}
+          </div>
+        </Field>
+      )}
       <Field
         group
         label="Cấp cho"
@@ -385,16 +459,28 @@ function GrantEditor({ grant, ctx, onClose, onDone }: { grant: Grant | null; ctx
       </Field>
 
       <Field group label="Phạm vi">
-        <Toggle checked={all} onChange={setAll} label="Tất cả cuộc trò chuyện" hint="Gồm cả các cuộc trò chuyện mới về sau." />
-        {!all && (
+        <Toggle
+          checked={all || everyAccount}
+          onChange={setAll}
+          disabled={everyAccount || !account}
+          label="Tất cả cuộc trò chuyện"
+          hint={
+            everyAccount
+              ? 'Bắt buộc khi cấp cho tất cả tài khoản: mỗi tài khoản có cuộc trò chuyện và nhãn riêng, nên không thể chọn từng cuộc trò chuyện cho mọi tài khoản.'
+              : !account
+                ? 'Chọn tài khoản Zalo trước.'
+                : 'Gồm cả các cuộc trò chuyện mới về sau.'
+          }
+        />
+        {scoped && !all && (
           <div className="scope-editor">
             <div className="field">
               <span className="field-label small">
                 <Tag size={13} /> Nhãn Zalo
               </span>
-              {ctx.account.labels.length ? (
+              {accData.labels.length ? (
                 <div className="chips">
-                  {ctx.account.labels.map((l) => (
+                  {accData.labels.map((l) => (
                     <LabelChip
                       key={l.id}
                       name={l.name}
@@ -422,12 +508,12 @@ function GrantEditor({ grant, ctx, onClose, onDone }: { grant: Grant | null; ctx
                   { label: 'Nhóm', test: (i) => !!i.group },
                   { label: 'Cá nhân', test: (i) => !i.group },
                 ]}
-                emptyText={ctx.account.conversations.length ? 'Không có kết quả' : 'Chưa có danh sách cuộc trò chuyện'}
+                emptyText={accData.conversations.length ? 'Không có kết quả' : 'Chưa có danh sách cuộc trò chuyện của tài khoản này'}
               />
               {unknownConvs.length > 0 && <span className="field-hint">{unknownConvs.length} cuộc trò chuyện đã chọn không còn trong danh sách.</span>}
             </div>
             <div className="scope-summary">
-              <Eye size={14} /> Thấy được <strong>{covered}</strong> / {ctx.account.conversations.length} cuộc trò chuyện hiện có
+              <Eye size={14} /> Thấy được <strong>{covered}</strong> / {accData.conversations.length} cuộc trò chuyện hiện có
             </div>
           </div>
         )}
@@ -440,7 +526,7 @@ function GrantEditor({ grant, ctx, onClose, onDone }: { grant: Grant | null; ctx
   );
 }
 
-function ViaList({ grants, ctx, onEdit, conv }: { grants: Grant[]; ctx: Ctx; onEdit: (g: Grant) => void; conv?: Conversation }) {
+function ViaList({ grants, ctx, onEdit, conv, account }: { grants: Grant[]; ctx: Ctx; onEdit: (g: Grant) => void; conv?: Conversation; account?: string }) {
   return (
     <ul className="via-list">
       {grants.map((g) => {
@@ -450,7 +536,7 @@ function ViaList({ grants, ctx, onEdit, conv }: { grants: Grant[]; ctx: Ctx; onE
           else if (g.scope.conversations.includes(conv.id)) how = 'chọn trực tiếp';
           else {
             const l = conv.labels.find((x) => g.scope.labels.includes(x));
-            const label = l ? ctx.labelById.get(l) : undefined;
+            const label = l && account ? labelOf(ctx, account, l) : undefined;
             how = label ? <>nhãn <LabelChip name={label.name} color={label.color} /></> : 'nhãn';
           }
         }
@@ -459,6 +545,7 @@ function ViaList({ grants, ctx, onEdit, conv }: { grants: Grant[]; ctx: Ctx; onE
             {g.subject.type === 'group' ? <UsersIcon size={13} /> : <UserIcon size={13} />}
             <span>
               {g.subject.type === 'group' ? `Nhóm ${subjectName(g.subject, ctx)}` : 'Cấp trực tiếp'} · {roleLabel(g.role)}
+              {grantAccount(g) === ALL_ACCOUNTS && ctx.multi && <> · mọi tài khoản</>}
               {how && <> · {how}</>}
             </span>
             <button type="button" className="link small" onClick={() => onEdit(g)}>
@@ -522,7 +609,7 @@ function UserAccess({ user, grants, ctx, onEdit }: { user: User; grants: Grant[]
       {user.disabled && <ErrorBox message="Tài khoản đang bị khóa: không đăng nhập được dù có quyền." />}
       {user.isAdmin ? (
         <p>
-          <RoleBadge role="admin" /> Quản trị viên thấy mọi cuộc trò chuyện với quyền nhân viên.
+          <RoleBadge role="admin" /> Quản trị viên thấy mọi cuộc trò chuyện của mọi tài khoản Zalo với quyền nhân viên.
         </p>
       ) : access.data === undefined ? (
         access.error ? (
@@ -532,66 +619,77 @@ function UserAccess({ user, grants, ctx, onEdit }: { user: User; grants: Grant[]
         )
       ) : (
         (() => {
-          const a = { ...access.data, scope: access.data.scope ?? { all: false, conversations: [], labels: [] } };
-          if (!a.role)
+          const a = access.data;
+          const ids = Object.keys(a.accounts);
+          if (!ids.length)
             return (
               <Empty title="Chưa có quyền">
                 Người này đăng nhập được nhưng không thấy cuộc trò chuyện nào. Cấp quyền trực tiếp hoặc thêm họ vào một nhóm đã có quyền.
               </Empty>
             );
-          const viaLabels = a.scope.all ? [] : ctx.account.conversations.filter((c) => !a.scope.conversations.includes(c.id) && c.labels.some((l) => a.scope.labels.includes(l)));
-          const via = a.via.map((v) => grantById.get(v.grantId) ?? { id: v.grantId, subject: v.subject, role: v.role, scope: { all: false, conversations: [], labels: [] }, note: '', createdAt: 0 });
+          const order = ctx.accounts.map((x) => x.id);
+          ids.sort((x, y) => (order.indexOf(x) + 1 || 999) - (order.indexOf(y) + 1 || 999));
+          const grantOf = (v: EffectiveAccess['via'][number]): Grant =>
+            grantById.get(v.grantId) ?? { id: v.grantId, subject: v.subject, account: v.account, role: v.role, scope: v.scope ?? { all: false, conversations: [], labels: [] }, note: '', createdAt: 0 };
           return (
-            <div className="stack">
-              <dl className="kv">
-                <dt>Vai trò</dt>
-                <dd>
-                  <RoleBadge role={a.role} />
-                  <div className="field-hint">{ROLE_HINT[a.role]}</div>
-                </dd>
-                <dt>Phạm vi</dt>
-                <dd>{scopeSummary(a.scope)}</dd>
-                <dt>Từ các quyền</dt>
-                <dd>
-                  <ViaList grants={via} ctx={ctx} onEdit={onEdit} />
-                </dd>
-              </dl>
-              {!a.scope.all && (
-                <>
-                  {a.scope.labels.length > 0 && (
-                    <div className="field">
-                      <span className="field-label small">Nhãn</span>
-                      <div className="chips">
-                        {a.scope.labels.map((id) => {
-                          const l = ctx.labelById.get(id);
-                          return <LabelChip key={id} name={l?.name ?? id} color={l?.color ?? ''} />;
-                        })}
-                      </div>
+            <div className="account-access-list">
+              {ids.map((id) => {
+                const acc = a.accounts[id];
+                const scope = acc.scope ?? { all: false, conversations: [], labels: [] };
+                const d = dataOf(ctx, id);
+                const via = a.via.filter((v) => (v.account || 'default') === id || v.account === ALL_ACCOUNTS).map(grantOf);
+                const viaLabels = scope.all ? [] : d.conversations.filter((c) => !scope.conversations.includes(c.id) && c.labels.some((l) => scope.labels.includes(l)));
+                return (
+                  <section key={id} className="account-access">
+                    <div className="account-access-head">
+                      {(ctx.multi || id !== 'default') && <AccountChip id={id} account={ctx.accountById.get(id)} size={24} />}
+                      <RoleBadge role={acc.role} />
+                      <span className="secondary small">{scopeSummary(scope)}</span>
                     </div>
-                  )}
-                  <div className="field">
-                    <span className="field-label small">Cuộc trò chuyện thấy được ({a.scope.conversations.length + viaLabels.length})</span>
-                    <ul className="conv-list">
-                      {a.scope.conversations.map((id) => {
-                        const c = ctx.convById.get(id);
-                        return (
-                          <li key={id}>
-                            <Avatar name={c?.name ?? id} src={c?.avatar} size={26} group={c?.isGroup} />
-                            <span className="truncate">{c?.name ?? id}</span>
-                          </li>
-                        );
-                      })}
-                      {viaLabels.map((c) => (
-                        <li key={c.id}>
-                          <Avatar name={c.name} src={c.avatar} size={26} group={c.isGroup} />
-                          <span className="truncate">{c.name}</span>
-                          <span className="secondary small">qua nhãn</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                </>
-              )}
+                    <div className="field-hint">{ROLE_HINT[acc.role]}</div>
+                    <div className="field">
+                      <span className="field-label small">Từ các quyền</span>
+                      <ViaList grants={via} ctx={ctx} onEdit={onEdit} account={id} />
+                    </div>
+                    {!scope.all && (
+                      <>
+                        {scope.labels.length > 0 && (
+                          <div className="field">
+                            <span className="field-label small">Nhãn</span>
+                            <div className="chips">
+                              {scope.labels.map((l) => {
+                                const x = labelOf(ctx, id, l);
+                                return <LabelChip key={l} name={x?.name ?? l} color={x?.color ?? ''} />;
+                              })}
+                            </div>
+                          </div>
+                        )}
+                        <div className="field">
+                          <span className="field-label small">Cuộc trò chuyện thấy được ({scope.conversations.length + viaLabels.length})</span>
+                          <ul className="conv-list">
+                            {scope.conversations.map((cid) => {
+                              const c = convOf(ctx, id, cid);
+                              return (
+                                <li key={cid}>
+                                  <Avatar name={c?.name ?? cid} src={c?.avatar} size={26} group={c?.isGroup} />
+                                  <span className="truncate">{c?.name ?? cid}</span>
+                                </li>
+                              );
+                            })}
+                            {viaLabels.map((c) => (
+                              <li key={c.id}>
+                                <Avatar name={c.name} src={c.avatar} size={26} group={c.isGroup} />
+                                <span className="truncate">{c.name}</span>
+                                <span className="secondary small">qua nhãn</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      </>
+                    )}
+                  </section>
+                );
+              })}
             </div>
           );
         })()
@@ -601,15 +699,36 @@ function UserAccess({ user, grants, ctx, onEdit }: { user: User; grants: Grant[]
 }
 
 function ByConversation({ grants, ctx, onEdit }: { grants: Grant[]; ctx: Ctx; onEdit: (g: Grant) => void }) {
+  // Keyed by (account, conversation): conversation ids are per account.
+  const [account, setAccount] = useState<string>(ctx.accounts[0]?.id ?? 'default');
   const [convId, setConvId] = useState<string | null>(null);
-  const items = useMemo(() => conversationItems(ctx), [ctx]);
-  const conv = convId ? ctx.convById.get(convId) : undefined;
-  const rows = useMemo(() => (conv ? whoSees(conv, ctx.users, grants, ctx.groups) : []), [conv, ctx, grants]);
+  const items = useMemo(() => conversationItems(ctx, account), [ctx, account]);
+  const conv = convId ? convOf(ctx, account, convId) : undefined;
+  const rows = useMemo(() => (conv ? whoSees(account, conv, ctx.users, grants, ctx.groups) : []), [account, conv, ctx, grants]);
   const admins = rows.filter((r) => r.role === 'admin');
   const others = rows.filter((r) => r.role !== 'admin');
   return (
     <div className="split">
       <Card title="Chọn cuộc trò chuyện" pad={false} className="split-side">
+        {ctx.multi && (
+          <div className="split-side-head">
+            <select
+              className="input"
+              value={account}
+              onChange={(e) => {
+                setAccount(e.target.value);
+                setConvId(null);
+              }}
+              aria-label="Tài khoản Zalo"
+            >
+              {ctx.accounts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {accountName(a)}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         {items.length ? (
           <SinglePicker items={items} value={convId} onChange={setConvId} placeholder="Tìm cuộc trò chuyện…" height={480} />
         ) : (
@@ -623,6 +742,11 @@ function ByConversation({ grants, ctx, onEdit }: { grants: Grant[]; ctx: Ctx; on
               <span className="cell-user">
                 <Avatar name={conv.name} src={conv.avatar} size={30} group={conv.isGroup} />
                 <span>{conv.name}</span>
+                {ctx.multi && (
+                  <span className="secondary small">
+                    · <AccountChip id={account} account={ctx.accountById.get(account)} size={18} />
+                  </span>
+                )}
               </span>
             }
           >
@@ -630,7 +754,7 @@ function ByConversation({ grants, ctx, onEdit }: { grants: Grant[]; ctx: Ctx; on
               {conv.labels.length > 0 && (
                 <div className="chips">
                   {conv.labels.map((id) => {
-                    const l = ctx.labelById.get(id);
+                    const l = labelOf(ctx, account, id);
                     return <LabelChip key={id} name={l?.name ?? id} color={l?.color ?? ''} />;
                   })}
                 </div>
@@ -644,7 +768,7 @@ function ByConversation({ grants, ctx, onEdit }: { grants: Grant[]; ctx: Ctx; on
                         <span>
                           {r.user.displayName || r.user.username} <RoleBadge role={r.role} />
                         </span>
-                        <ViaList grants={r.via} ctx={ctx} onEdit={onEdit} conv={conv} />
+                        <ViaList grants={r.via} ctx={ctx} onEdit={onEdit} conv={conv} account={account} />
                       </span>
                     </li>
                   ))}
@@ -657,7 +781,7 @@ function ByConversation({ grants, ctx, onEdit }: { grants: Grant[]; ctx: Ctx; on
                   Quản trị viên (luôn thấy): {admins.map((r) => r.user.displayName || r.user.username).join(', ')}
                 </p>
               )}
-              <p className="field-hint">Vai trò là vai trò cao nhất của người dùng trên mọi quyền của họ, không riêng cuộc trò chuyện này.</p>
+              <p className="field-hint">Vai trò là vai trò cao nhất của người dùng trên mọi quyền của họ ở tài khoản này, không riêng cuộc trò chuyện này.</p>
             </div>
           </Card>
         ) : (

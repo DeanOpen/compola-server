@@ -1,7 +1,7 @@
 // In-memory Compola Server for `npm run dev:admin` with `?mock=1`: every endpoint of docs/compola-server.md, enough
 // to click through all screens. Loaded with a dynamic import only in mock mode; not part of a production build.
-import { effective } from './access';
-import type { ActivityEntry, ActivityStatsRow, AuditEntry, Conversation, Grant, Group, Label, Provider, ServerInfo, Session, User, ZaloPhase } from './types';
+import { effective, multiAccess } from './access';
+import type { ActivityEntry, ActivityStatsRow, AuditEntry, Conversation, Grant, Group, Label, Provider, ServerInfo, Session, User, ZaloAccount, ZaloPhase } from './types';
 
 type Res = { status: number; body: unknown };
 
@@ -65,11 +65,47 @@ const conversations: Conversation[] = convNames.map(([name, isGroup, ls], i) => 
   labels: ls,
 }));
 
+// A second Zalo account (warehouse) with its own conversations and labels; the third account is still on its QR.
+const labels2: Label[] = [
+  { id: 'k_don', name: 'Đơn mới', color: '#0068ff' },
+  { id: 'k_giao', name: 'Đang giao', color: '#e0ac00' },
+  { id: 'k_loi', name: 'Khiếu nại', color: '#e5484d' },
+];
+const conversations2: Conversation[] = (
+  [
+    ['Đại lý Bắc Ninh', true, ['k_don']],
+    ['Nguyễn Hữu Thắng', false, ['k_giao']],
+    ['Kho Long Biên', true, []],
+    ['Trần Thu Trang', false, ['k_loi']],
+    ['Xe tải 29C-123.45', false, ['k_giao']],
+    ['Phạm Gia Bảo', false, ['k_don']],
+    ['Nhóm Giao nhận HN', true, []],
+    ['Lý Thị Ngọc', false, ['k_don', 'k_loi']],
+  ] as [string, boolean, string[]][]
+).map(([name, isGroup, ls], i) => ({ id: `${isGroup ? 'g' : 'u'}${8_100_000 + i * 977}`, name, isGroup, avatar: '', labels: ls }));
+
+interface MockAccount extends Omit<ZaloAccount, 'phase' | 'active'> {
+  /** 'ready', 'qr' (waiting on its QR), or the start (ms) of a running QR → ready cycle. */
+  state: 'ready' | 'qr' | number;
+  conversations: Conversation[];
+  labels: Label[];
+}
+const zaloAccounts: MockAccount[] = [
+  { id: 'default', uid: '8412339011', name: 'Shop Compola', label: '', avatar: '', order: 0, enabled: true, badge: 12, state: 'ready', conversations, labels },
+  { id: 'a1b2c3d4e', uid: '7300218845', name: 'Kho Hà Nội', label: 'Kho HN', avatar: '', order: 1, enabled: true, badge: 3, state: 'ready', conversations: conversations2, labels: labels2 },
+  { id: 'a9f00001c', uid: '', name: '', label: 'Chi nhánh Đà Nẵng', avatar: '', order: 2, enabled: true, badge: 0, state: 'qr', conversations: [], labels: [] },
+];
+const MAX_ACCOUNTS = 5;
+let activeAccount = 'default';
+const accountIds = () => zaloAccounts.map((a) => a.id);
+
 const grants: Grant[] = [
-  { id: 'gr_1', subject: { type: 'group', id: 'g_cskh' }, role: 'agent', scope: { all: false, conversations: [conversations[0].id, conversations[3].id, conversations[13].id], labels: ['l_khach'] }, note: 'Ca ngày', createdAt: now - 20 * day },
-  { id: 'gr_2', subject: { type: 'group', id: 'g_sales' }, role: 'agent', scope: { all: false, conversations: [conversations[2].id], labels: ['l_vip'] }, note: '', createdAt: now - 15 * day },
-  { id: 'gr_3', subject: { type: 'user', id: 'u_hoa' }, role: 'viewer', scope: { all: false, conversations: [conversations[5].id, conversations[4].id], labels: ['l_ncc'] }, note: 'Đối soát công nợ', createdAt: now - 10 * day },
-  { id: 'gr_4', subject: { type: 'user', id: 'u_minh' }, role: 'viewer', scope: { all: true, conversations: [], labels: [] }, note: 'Trưởng nhóm: xem toàn bộ', createdAt: now - 8 * day },
+  { id: 'gr_1', subject: { type: 'group', id: 'g_cskh' }, account: 'default', role: 'agent', scope: { all: false, conversations: [conversations[0].id, conversations[3].id, conversations[13].id], labels: ['l_khach'] }, note: 'Ca ngày', createdAt: now - 20 * day },
+  { id: 'gr_2', subject: { type: 'group', id: 'g_sales' }, account: 'default', role: 'agent', scope: { all: false, conversations: [conversations[2].id], labels: ['l_vip'] }, note: '', createdAt: now - 15 * day },
+  { id: 'gr_3', subject: { type: 'user', id: 'u_hoa' }, account: 'default', role: 'viewer', scope: { all: false, conversations: [conversations[5].id, conversations[4].id], labels: ['l_ncc'] }, note: 'Đối soát công nợ', createdAt: now - 10 * day },
+  { id: 'gr_4', subject: { type: 'user', id: 'u_minh' }, account: '*', role: 'viewer', scope: { all: true, conversations: [], labels: [] }, note: 'Trưởng nhóm: xem toàn bộ mọi tài khoản', createdAt: now - 8 * day },
+  { id: 'gr_5', subject: { type: 'group', id: 'g_cskh' }, account: 'a1b2c3d4e', role: 'agent', scope: { all: false, conversations: [conversations2[1].id, conversations2[3].id], labels: ['k_loi'] }, note: 'Khiếu nại kho', createdAt: now - 6 * day },
+  { id: 'gr_6', subject: { type: 'user', id: 'u_vy' }, account: 'a1b2c3d4e', role: 'agent', scope: { all: true, conversations: [], labels: [] }, note: '', createdAt: now - 4 * day },
 ];
 
 const providers: Provider[] = [
@@ -210,15 +246,19 @@ let zaloCycle: number | null = zaloPin === 'login' ? Date.now() : null; // start
 let qrSeed = 7;
 const prepStart = Date.now();
 
-function zaloPhase(): ZaloPhase {
-  const qr = fakeQr(qrSeed);
+function zaloPhase(acc: MockAccount = zaloAccounts[0]): ZaloPhase {
+  const qr = fakeQr(qrSeed + acc.order * 13);
   const login = (step: Extract<ZaloPhase, { kind: 'login' }>['login']['step'], extra: Partial<Extract<ZaloPhase, { kind: 'login' }>> = {}, isSecondQr = false): ZaloPhase => ({
     kind: 'login',
     login: { step, qr, isSecondQr },
     notice: null,
     ...extra,
   });
-  switch (zaloPin) {
+  if (acc.id !== 'default') {
+    if (acc.state === 'ready') return { kind: 'ready' };
+    if (acc.state === 'qr') return login({ kind: 'waitingScan' });
+  }
+  switch (acc.id === 'default' ? zaloPin : null) {
     case 'expired':
       return login({ kind: 'expired' });
     case 'failed':
@@ -240,18 +280,31 @@ function zaloPhase(): ZaloPhase {
         : { kind: 'preparing', setup: { step: 'downloading', received: 121_400_000, total, failure: 'Tải phần lõi Zalo PC thất bại: kết nối bị ngắt (HTTP 503).' } };
     }
   }
-  if (zaloCycle === null) return { kind: 'ready' };
-  const t = Date.now() - zaloCycle;
+  if (acc.id === 'default' && zaloCycle !== null && typeof acc.state !== 'number') acc.state = zaloCycle;
+  if (acc.state === 'ready' || acc.state === 'qr') return acc.state === 'ready' ? { kind: 'ready' } : login({ kind: 'waitingScan' });
+  const t = Date.now() - acc.state;
   if (t < 600) return { kind: 'login', login: { step: { kind: 'generating' }, qr: null, isSecondQr: false }, notice: null };
   if (t < 10_000) return login({ kind: 'waitingScan' });
-  if (t < 16_000) return login({ kind: 'waitingConfirm', name: server.account?.name ?? 'Shop Compola', avatar: '' });
+  if (t < 16_000) return login({ kind: 'waitingConfirm', name: acc.name || acc.label || 'Zalo', avatar: '' });
   if (t < 19_000) return { kind: 'signingIn' };
-  zaloCycle = null;
+  acc.state = 'ready';
+  if (!acc.name) acc.name = acc.label || 'Tài khoản mới';
+  if (!acc.uid) acc.uid = String(7_000_000_000 + Math.floor(Math.random() * 1e9));
+  if (acc.id === 'default') zaloCycle = null;
   return { kind: 'ready' };
 }
 
+function accountSummary(acc: MockAccount): ZaloAccount {
+  const phase = zaloPhase(acc);
+  const { state: _s, conversations: _c, labels: _l, ...rest } = acc;
+  void _s;
+  void _c;
+  void _l;
+  return { ...rest, name: phase.kind === 'ready' ? acc.name : acc.name, active: acc.id === activeAccount, phase: phase.kind, badge: phase.kind === 'ready' ? acc.badge : 0 };
+}
+
 function zaloStatus() {
-  const phase = zaloPhase();
+  const phase = zaloPhase(zaloAccounts[0]);
   const account = { name: phase.kind === 'ready' ? 'Shop Compola' : '', avatar: '', phase: phase.kind };
   server.account = account;
   return { phase, account };
@@ -316,7 +369,8 @@ const activity: ActivityEntry[] = (() => {
         const at = base + (8 + rnd() * 12) * 3_600_000;
         if (at > now) continue;
         const action = draw(p.mix);
-        const conv = pick(conversations);
+        const acc = p.id === 'u_hoa' || rnd() < 0.7 ? zaloAccounts[0] : zaloAccounts[1];
+        const conv = pick(acc.conversations);
         const user = p.id ? users.find((u) => u.id === p.id) ?? null : null;
         const refused = p.id === 'u_hoa' && action === 'message.send';
         const ok = !refused && rnd() > 0.02;
@@ -325,7 +379,8 @@ const activity: ActivityEntry[] = (() => {
         out.push({
           id: 0,
           at: Math.round(at),
-          account: '',
+          account: acc.id,
+          accountUid: acc.uid,
           user: user ? { id: user.id, username: user.username, displayName: user.displayName } : null,
           device: deviceOf(p.id),
           action,
@@ -484,9 +539,10 @@ function log(action: string, target: string, detail: Record<string, unknown> | n
 
 function meOf(u: User) {
   const session = sessions.find((x) => x.user?.id === u.id && x.kind === 'web') ?? null;
-  if (u.isAdmin) return { user: u, session, access: { role: 'admin', scope: { all: true, conversations: [], labels: [] } } };
-  const eff = effective(u.id, grants, groups);
-  return { user: u, session, access: eff.role ? { role: eff.role, scope: eff.scope } : null };
+  const access = multiAccess(u, grants, groups, accountIds());
+  // Like the WS hello: summaries of the accounts this user may see.
+  const visible = Object.fromEntries(zaloAccounts.filter((a) => access.accounts[a.id]).map((a) => [a.id, a.label || a.name]));
+  return { user: u, session, access: access.admin || Object.keys(access.accounts).length ? access : null, accounts: visible };
 }
 
 function publicProviders() {
@@ -566,7 +622,7 @@ export async function handle(method: string, rawPath: string, body: unknown): Pr
   }
   if (route === 'POST /api/device/approve') {
     if (!/^[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(String(b.userCode).toUpperCase())) return err(404, 'Mã thiết bị không hợp lệ hoặc đã hết hạn.');
-    if (b.approve && !me.isAdmin && !effective(me.id, grants, groups).role) return err(403, 'Tài khoản chưa được cấp quyền.');
+    if (b.approve && !me.isAdmin && !Object.keys(multiAccess(me, grants, groups, accountIds()).accounts).length) return err(403, 'Tài khoản chưa được cấp quyền.');
     log('device.approve', String(b.userCode), { deviceName: 'MacBook Pro', deviceId: '3c9d7e21-6b4f-4a8d-91e3-f2b07c5a8d19', deviceIp: '192.168.1.77', approved: !!b.approve });
     return ok();
   }
@@ -646,7 +702,8 @@ export async function handle(method: string, rawPath: string, body: unknown): Pr
     case 'grants': {
       if (method === 'GET' && !id) return ok(grants);
       if (method === 'POST' && !id) {
-        const g: Grant = { id: nid('gr'), subject: b.subject, role: b.role, scope: b.scope, note: b.note ?? '', createdAt: Date.now() };
+        if (b.account === '*' && !b.scope?.all) return err(400, 'Quyền cho mọi tài khoản phải có phạm vi “Tất cả cuộc trò chuyện”.');
+        const g: Grant = { id: nid('gr'), subject: b.subject, account: b.account ?? 'default', role: b.role, scope: b.scope, note: b.note ?? '', createdAt: Date.now() };
         grants.push(g);
         log('grant.create', g.subject.id);
         return ok({ grant: g });
@@ -654,6 +711,7 @@ export async function handle(method: string, rawPath: string, body: unknown): Pr
       const g = grants.find((x) => x.id === id);
       if (!g) return err(404, 'Không tìm thấy quyền.');
       if (method === 'PATCH') {
+        if ((b.account ?? g.account) === '*' && !(b.scope ?? g.scope).all) return err(400, 'Quyền cho mọi tài khoản phải có phạm vi “Tất cả cuộc trò chuyện”.');
         Object.assign(g, b, { id: g.id, createdAt: g.createdAt });
         log('grant.update', g.subject.id);
         return ok({ grant: g });
@@ -668,13 +726,63 @@ export async function handle(method: string, rawPath: string, body: unknown): Pr
     case 'access': {
       const u = users.find((x) => x.id === id);
       if (!u) return err(404, 'Không tìm thấy người dùng.');
-      if (u.isAdmin) return ok({ user: u, role: 'admin', scope: { all: true, conversations: [], labels: [] }, via: [{ admin: true }] });
-      const eff = effective(u.id, grants, groups);
-      if (!eff.role) return ok({ user: u, role: null, scope: null, via: [] });
-      return ok({ role: eff.role, scope: eff.scope, via: eff.via.map((g) => ({ grantId: g.id, subject: g.subject, role: g.role })) });
+      const a = multiAccess(u, grants, groups, accountIds());
+      const via = u.isAdmin ? [] : effective(u.id, grants, groups).via.map((g) => ({ grantId: g.id, subject: g.subject, account: g.account, role: g.role, scope: g.scope }));
+      return ok({ user: { id: u.id, username: u.username, displayName: u.displayName }, ...a, via });
     }
-    case 'conversations':
-      return ok({ conversations, labels });
+    case 'conversations': {
+      const acc = zaloAccounts.find((x) => x.id === (q.get('account') || 'default'));
+      if (!acc) return err(404, 'Không có tài khoản này.');
+      return ok({ conversations: acc.conversations, labels: acc.labels });
+    }
+    case 'accounts': {
+      if (method === 'GET' && !id) return ok({ active: activeAccount, maxAccounts: MAX_ACCOUNTS, accounts: zaloAccounts.map(accountSummary) });
+      if (method === 'POST' && !id) {
+        if (zaloAccounts.length >= MAX_ACCOUNTS) return err(409, `Đã đủ ${MAX_ACCOUNTS} tài khoản.`);
+        const acc: MockAccount = { id: 'a' + Math.random().toString(16).slice(2, 10).padEnd(8, '0'), uid: '', name: '', label: '', avatar: '', order: zaloAccounts.length, enabled: true, badge: 0, state: Date.now(), conversations: [], labels: [] };
+        zaloAccounts.push(acc);
+        log('zalo.add', acc.id, { account: acc.id });
+        return ok({ id: acc.id });
+      }
+      if (method === 'PUT' && id === 'order') {
+        const ids: string[] = b.ids ?? [];
+        zaloAccounts.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
+        zaloAccounts.forEach((x, i) => (x.order = i));
+        return ok();
+      }
+      const acc = zaloAccounts.find((x) => x.id === id);
+      if (!acc) return err(404, 'Không có tài khoản này.');
+      if (method === 'GET' && !sub) return ok({ account: accountSummary(acc), phase: zaloPhase(acc) });
+      if (method === 'POST' && sub === 'qr') {
+        qrSeed++;
+        if (acc.state !== 'ready') acc.state = Date.now();
+        log('zalo.qr', '', { account: acc.id });
+        return ok();
+      }
+      if (method === 'POST' && sub === 'logout') {
+        log('zalo.logout', acc.label || acc.name, { account: acc.id });
+        acc.state = Date.now();
+        if (acc.id === 'default') zaloCycle = acc.state;
+        qrSeed++;
+        return ok();
+      }
+      if (method === 'PATCH') {
+        if (typeof b.label === 'string') acc.label = b.label.trim();
+        if (typeof b.enabled === 'boolean') acc.enabled = b.enabled;
+        log('zalo.update', acc.label || acc.name, { account: acc.id });
+        return ok({ account: accountSummary(acc) });
+      }
+      if (method === 'DELETE') {
+        if (acc.id === 'default') return err(400, 'Không xoá được tài khoản chính; chỉ có thể đăng xuất.');
+        zaloAccounts.splice(zaloAccounts.indexOf(acc), 1);
+        zaloAccounts.forEach((x, i) => (x.order = i));
+        for (let i = grants.length - 1; i >= 0; i--) if (grants[i].account === acc.id) grants.splice(i, 1);
+        if (activeAccount === acc.id) activeAccount = 'default';
+        log('zalo.remove', acc.label || acc.name || acc.id, { account: acc.id });
+        return ok();
+      }
+      break;
+    }
     case 'providers': {
       if (method === 'GET' && !id) return ok(providers.map(maskProvider));
       if (method === 'POST' && !id) {
@@ -752,13 +860,14 @@ export async function handle(method: string, rawPath: string, body: unknown): Pr
       if (method === 'GET') return ok(zaloStatus());
       if (method === 'POST' && id === 'qr') {
         qrSeed++;
-        if (zaloCycle !== null) zaloCycle = Date.now();
+        if (zaloCycle !== null) zaloCycle = zaloAccounts[0].state = Date.now();
         log('zalo.qr', '', {});
         return ok();
       }
       if (method === 'POST' && id === 'logout') {
         log('zalo.logout', server.account?.name ?? '', {});
         zaloCycle = Date.now();
+        zaloAccounts[0].state = zaloCycle;
         qrSeed++;
         return ok();
       }
