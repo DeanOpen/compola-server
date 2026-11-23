@@ -1,24 +1,25 @@
-//! Compola Server: one Compola app shares its signed-in Zalo account, other Compola apps join it and use that account
-//! remotely (docs/compola-server.md).
+//! Compola Server: one Compola app (the host) shares its signed-in Zalo account; people sign in to it (local
+//! accounts, LDAP, SSO) from other Compola apps and use the account with the role and conversations an admin gave
+//! them. The host also serves an admin console. Design and contracts: docs/compola-server.md.
 //!
-//! * **Host** (`server`): Settings › Compola Server. HTTP + WebSocket on `0.0.0.0:<port>` (or loopback only, for a
-//!   tunnel / reverse proxy). Every request carries `Authorization: Bearer <access code>`. The UI contract of the
-//!   engine travels over `/ws`: the joined app's commands (`engine_call`, `engine_replay`, …, an allow-list) and the
-//!   engine's UI events (`compola://phase|state|badge|page`) plus the renderer's notifications. Media and files go over
-//!   plain HTTP (`/media/load` answers exactly like the `compola-media` scheme, `/upload` takes the files to send).
-//! * **Joined app** (`client`): the login screen's "Compola Server" tab. The local engine does not start; Rust keeps
-//!   one WebSocket to the host, re-emits its events to the UI window, forwards the UI's commands (`remote_invoke`) and
-//!   the `compola-media` requests, uploads picked files before sending them, and shows the host's notifications.
+//! * Host: `server` (listener, WebSocket sessions, uploads, media), `api` (REST + admin console), `store` (SQLite:
+//!   users, groups, grants, sessions, providers, audit), `auth` (passwords, LDAP, OIDC, device flow), `policy`
+//!   (filters what each user sees and may do).
+//! * Joined app: `client`. The local engine does not start; Rust keeps one WebSocket to the host.
 //!
-//! The Zalo session (cookies, databases, keys) never leaves the host: a joined app only sees what the UI sees.
+//! The Zalo session (cookies, databases, keys) never leaves the host.
 
+mod api;
+mod auth;
 mod client;
 mod http;
+pub mod policy;
 mod server;
+mod store;
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -26,9 +27,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 pub use client::Client;
 
 pub const DEFAULT_PORT: u16 = 39218;
-/// UI event about Compola Server: `{kind: "changed"}` (host settings, devices) or `{kind: "connection", …status}`.
+/// UI event about Compola Server: `{kind: "changed"}`, `{kind: "connection", …}`, `{kind: "joinProgress", …}`,
+/// `{kind: "access", access}`.
 pub const EVENT: &str = "compola://remote";
-/// The engine events a joined app's UI receives.
+/// The engine events a joined app's UI receives (filtered per user).
 const FORWARDED: &[&str] = &["compola://phase", "compola://state", "compola://badge", "compola://page"];
 /// A notification the host's renderer created (`notifications::deliver_remote` on the joined app).
 const NOTIFICATION_EVENT: &str = "compola://remote-notification";
@@ -44,15 +46,15 @@ pub struct ServerConfig {
     pub port: u16,
     /// Listen on every interface (LAN, Tailscale); false = loopback only (behind a tunnel or reverse proxy).
     pub allow_network: bool,
-    /// The access code joined apps present (`XXXXX-XXXXX-XXXXX-XXXXX-XXXXX`).
-    pub code: String,
-    /// Shown to joined apps.
+    /// Shown to people signing in.
     pub name: String,
+    /// How people reach this server (SSO redirects, device links). Empty = `http://<LAN address>:<port>`.
+    pub public_url: String,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { enabled: false, port: DEFAULT_PORT, allow_network: true, code: new_code(), name: computer_name() }
+        Self { enabled: false, port: DEFAULT_PORT, allow_network: true, name: computer_name(), public_url: String::new() }
     }
 }
 
@@ -61,9 +63,12 @@ impl Default for ServerConfig {
 pub struct JoinConfig {
     /// Normalized base URL (`http(s)://host:port/`).
     pub url: String,
-    pub code: String,
+    /// The device session token (a server user's sign-in on this install).
+    pub token: String,
     pub device_name: String,
     pub server_name: String,
+    pub username: String,
+    pub display_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -71,14 +76,17 @@ pub struct JoinConfig {
 pub struct LastJoin {
     pub url: String,
     pub device_name: String,
+    pub username: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
-    /// Random id of this installation (an app may not join itself).
+    /// Random id of this install: the device id joined sessions carry (never an identity).
     pub instance: String,
     pub server: ServerConfig,
+    /// The admin the host app's "Mở trang quản trị" signs in as.
+    pub owner_user_id: String,
     /// Set while this app is joined to a Compola Server.
     pub join: Option<JoinConfig>,
     /// The last server left, to prefill the join form.
@@ -91,12 +99,17 @@ fn config_path() -> std::path::PathBuf {
 
 fn load() -> Config {
     let mut config: Config = std::fs::read(config_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut dirty = false;
     if config.instance.is_empty() {
         config.instance = uuid::Uuid::new_v4().simple().to_string();
-        let _ = save(&config);
+        dirty = true;
     }
-    if normalize_code(&config.server.code).len() < 20 {
-        config.server.code = new_code();
+    if config.join.as_ref().is_some_and(|j| j.token.is_empty()) {
+        // A join from before user accounts (access code): sign in again.
+        config.join = None;
+        dirty = true;
+    }
+    if dirty {
         let _ = save(&config);
     }
     config
@@ -115,33 +128,6 @@ fn save(config: &Config) -> Result<(), String> {
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
     std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
-}
-
-/// No 0/O, 1/I/L: easy to read out and type on another machine.
-const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-
-/// 25 characters from a 31-letter alphabet (≈124 bits), in groups of five.
-pub fn new_code() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    (0..5)
-        .map(|_| (0..5).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-/// Upper case, letters and digits only (dashes and spaces typed or pasted along are ignored).
-pub fn normalize_code(code: &str) -> String {
-    code.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()).collect()
-}
-
-/// Constant-time comparison of two normalized codes.
-pub fn codes_match(expected: &str, given: &str) -> bool {
-    let (a, b) = (normalize_code(expected), normalize_code(given));
-    if a.is_empty() || a.len() != b.len() {
-        return false;
-    }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The Mac's name (System Settings › General › Sharing), else its host name.
@@ -215,18 +201,37 @@ pub struct Remote {
     server_error: Mutex<Option<String>>,
     /// Set (for the app's lifetime) when this app is joined to a Compola Server.
     client: Option<Arc<Client>>,
+    /// Accounts and sign-in of the host (None when the database cannot be opened).
+    auth: Option<Arc<auth::Auth>>,
+    /// What the host's renderer posted, for the policy and the admin console's conversation picker.
+    mirror: RwLock<policy::Mirror>,
+    /// Cancels a browser sign-in under way (`remote_join_cancel`).
+    join_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// The listener runs: the mirror follows the renderer's state.
+    serving: std::sync::atomic::AtomicBool,
 }
 
 impl Remote {
     pub fn new(app: AppHandle) -> Arc<Self> {
         let config = load();
-        let client = config.join.clone().and_then(|join| match Client::new(app.clone(), join) {
+        let client = config.join.clone().and_then(|join| match Client::new(app.clone(), join, config.instance.clone()) {
             Ok(c) => Some(c),
             Err(e) => {
                 log::warn!("compola server: saved join is unusable ({e}); starting locally");
                 None
             }
         });
+        let auth = if client.is_some() {
+            None
+        } else {
+            match store::Store::open(&store::Store::path()) {
+                Ok(s) => Some(Arc::new(auth::Auth::new(Arc::new(s)))),
+                Err(e) => {
+                    log::warn!("compola server: accounts database: {e}");
+                    None
+                }
+            }
+        };
         Arc::new(Self {
             app,
             config: Mutex::new(config),
@@ -234,6 +239,10 @@ impl Remote {
             server: tokio::sync::Mutex::new(None),
             server_error: Mutex::new(None),
             client,
+            auth,
+            mirror: RwLock::new(policy::Mirror::default()),
+            join_cancel: Mutex::new(None),
+            serving: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -243,6 +252,8 @@ impl Remote {
     }
 
     pub fn start(self: &Arc<Self>) {
+        #[cfg(debug_assertions)]
+        self.bootstrap_admin_from_env();
         if let Some(client) = &self.client {
             client.start();
             return;
@@ -253,8 +264,44 @@ impl Remote {
         }
     }
 
+    /// Development aid: `COMPOLA_SERVER_ADMIN=user:password` creates the first admin (debug builds only).
+    #[cfg(debug_assertions)]
+    fn bootstrap_admin_from_env(&self) {
+        let (Some(auth), Ok(spec)) = (self.auth(), std::env::var("COMPOLA_SERVER_ADMIN")) else { return };
+        let Some((user, password)) = spec.split_once(':') else { return };
+        if auth.store.count_admins().unwrap_or(1) == 0 {
+            if let Ok(hash) = auth::hash_password(password) {
+                let _ = auth.store.create_user(user, user, "", "local", Some(&hash), true);
+            }
+        }
+    }
+
+    fn auth(&self) -> Option<Arc<auth::Auth>> {
+        self.auth.clone()
+    }
+
     fn server_config(&self) -> ServerConfig {
         self.config.lock().server.clone()
+    }
+
+    fn server_name(&self) -> String {
+        let name = self.config.lock().server.name.clone();
+        if name.trim().is_empty() { computer_name() } else { name }
+    }
+
+    /// How people reach this server, without a trailing slash.
+    fn public_url(&self) -> String {
+        let c = self.server_config();
+        let configured = c.public_url.trim().trim_end_matches('/').to_owned();
+        if !configured.is_empty() {
+            return configured;
+        }
+        let host = if c.allow_network {
+            local_addresses().first().and_then(|a| a.get("ip").and_then(Value::as_str).map(str::to_owned)).unwrap_or_else(|| "127.0.0.1".into())
+        } else {
+            "127.0.0.1".into()
+        };
+        format!("http://{host}:{}", c.port)
     }
 
     fn changed(&self) {
@@ -266,14 +313,28 @@ impl Remote {
         let config = self.server_config();
         let mut slot = self.server.lock().await;
         *slot = None;
+        self.serving.store(false, std::sync::atomic::Ordering::Relaxed);
         self.hub.kick_all("restarted");
         *self.server_error.lock() = None;
         if config.enabled && self.client.is_none() {
-            match server::start(Arc::downgrade(self), config.port, config.allow_network).await {
-                Ok(handle) => *slot = Some(handle),
-                Err(e) => {
-                    log::warn!("compola server: {e}");
-                    *self.server_error.lock() = Some(e);
+            if self.auth.is_none() {
+                *self.server_error.lock() = Some("Không mở được cơ sở dữ liệu tài khoản (server.db).".into());
+            } else {
+                match server::start(Arc::downgrade(self), config.port, config.allow_network).await {
+                    Ok(handle) => {
+                        // What the renderer posted before the server started.
+                        let mut mirror = policy::Mirror::default();
+                        for event in self.engine().map(|e| e.replay()).unwrap_or_default() {
+                            mirror.observe(&event);
+                        }
+                        *self.mirror.write() = mirror;
+                        self.serving.store(true, std::sync::atomic::Ordering::Relaxed);
+                        *slot = Some(handle);
+                    }
+                    Err(e) => {
+                        log::warn!("compola server: {e}");
+                        *self.server_error.lock() = Some(e);
+                    }
                 }
             }
         }
@@ -301,22 +362,108 @@ impl Remote {
             .unwrap_or_else(|| "starting".into())
     }
 
+    /// An admin changed users, groups or grants: connected users get their new access (or are disconnected).
+    fn access_changed(&self) {
+        let Some(auth) = self.auth() else { return };
+        self.hub.refresh_access(
+            |user_id| auth.store.user(user_id).ok().and_then(|u| auth.store.access_of(&u).ok()).and_then(|(a, _)| a),
+            |access| self.mirror.read().conversations_snapshot(access),
+        );
+        self.changed();
+    }
+
+    fn session_revoked(&self, session_id: &str) {
+        self.hub.kick_session(session_id, "revoked");
+        self.changed();
+    }
+
+    fn online_sessions(&self) -> Vec<String> {
+        self.hub.online_sessions()
+    }
+
+    /// The signed-in Zalo account, from the profile the renderer posted.
+    fn account_json(&self) -> Value {
+        let profile = self.engine().map(|e| e.replay()).and_then(|events| {
+            events.into_iter().rev().find_map(|e| e.get("user").filter(|u| u.get("userId").is_some()).cloned())
+        });
+        let text = |k: &str| profile.as_ref().and_then(|p| p.get(k)).and_then(Value::as_str).unwrap_or_default().to_owned();
+        json!({
+            "name": if text("displayName").is_empty() { text("zaloName") } else { text("displayName") },
+            "avatar": text("avatar"),
+            "phase": self.phase_kind(),
+        })
+    }
+
+    fn server_info_json(&self) -> Value {
+        let c = self.server_config();
+        json!({
+            "name": self.server_name(),
+            "version": server::version(),
+            "publicUrl": self.public_url(),
+            "publicUrlConfigured": c.public_url,
+            "account": self.account_json(),
+            "listen": { "port": c.port, "allowNetwork": c.allow_network },
+            "addresses": local_addresses(),
+            "online": self.hub.clients_json(),
+        })
+    }
+
+    fn update_server_identity(&self, name: Option<String>, public_url: Option<String>) -> Result<(), String> {
+        let public_url = match public_url {
+            Some(u) if !u.trim().is_empty() => {
+                let parsed = url::Url::parse(u.trim()).map_err(|_| "Địa chỉ công khai phải là URL đầy đủ, ví dụ https://compola.congty.vn".to_owned())?;
+                if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                    return Err("Địa chỉ công khai phải bắt đầu bằng http:// hoặc https://".into());
+                }
+                Some(parsed.as_str().trim_end_matches('/').to_owned())
+            }
+            Some(_) => Some(String::new()),
+            None => None,
+        };
+        self.update_config(|c| {
+            if let Some(n) = name.map(|n| n.trim().chars().take(60).collect::<String>()) {
+                c.server.name = if n.is_empty() { computer_name() } else { n };
+            }
+            if let Some(u) = public_url {
+                c.server.public_url = u;
+            }
+        })?;
+        self.changed();
+        Ok(())
+    }
+
     async fn state_json(&self) -> Value {
         let config = self.config.lock().clone();
         let running = self.server.lock().await.as_ref().map(|h| h.port);
+        let has_admin = self.auth().and_then(|a| a.store.count_admins().ok()).is_some_and(|n| n > 0);
         json!({
             "mode": if self.is_joined() { "joined" } else { "local" },
             "computerName": computer_name(),
+            "deviceId": config.instance,
             "server": {
                 "config": config.server,
                 "running": running.is_some(),
                 "error": self.server_error.lock().clone(),
                 "addresses": local_addresses(),
-                "clients": self.hub.clients_json(),
+                "publicUrl": self.public_url(),
+                "hasAdmin": has_admin,
+                "adminUrl": format!("{}/admin/", self.public_url()),
+                "sessions": self.hub.clients_json(),
             },
-            "join": config.join.as_ref().map(|j| json!({ "url": j.url, "deviceName": j.device_name, "serverName": j.server_name })),
+            "join": config.join.as_ref().map(|j| json!({
+                "url": j.url, "deviceName": j.device_name, "serverName": j.server_name,
+                "user": { "username": j.username, "displayName": j.display_name },
+            })),
             "lastJoin": config.last_join,
             "connection": self.client.as_ref().map(|c| c.status_json()),
+        })
+    }
+
+    fn save_join(&self, join: JoinConfig) -> Result<(), String> {
+        let last = LastJoin { url: join.url.clone(), device_name: join.device_name.clone(), username: join.username.clone() };
+        self.update_config(|c| {
+            c.join = Some(join);
+            c.last_join = Some(last);
         })
     }
 }
@@ -326,18 +473,31 @@ pub fn client(app: &AppHandle) -> Option<Arc<Client>> {
     app.try_state::<Arc<Remote>>().and_then(|r| r.client.clone())
 }
 
-/// `emit_ui` hook: hands the engine's UI events to the joined apps.
+/// `emit_ui` hook: keeps the policy mirror current and hands the engine's UI events to the joined apps.
 pub fn forward_event<S: Serialize>(app: &AppHandle, event: &str, payload: &S) {
     if !FORWARDED.contains(&event) {
         return;
     }
     let Some(remote) = app.try_state::<Arc<Remote>>() else { return };
+    if remote.client.is_some() {
+        return;
+    }
+    let observe = remote.serving.load(std::sync::atomic::Ordering::Relaxed) && (event == "compola://state" || event == "compola://page");
+    if !observe && !remote.hub.has_clients() {
+        return;
+    }
+    let Ok(value) = serde_json::to_value(payload) else { return };
+    if event == "compola://state" {
+        remote.mirror.write().observe(&value);
+    } else if event == "compola://page" && matches!(value.as_str(), Some("main" | "Main")) {
+        remote.mirror.write().reset();
+    }
     if remote.hub.has_clients() {
-        remote.hub.publish(&json!({ "t": "event", "event": event, "payload": payload }));
+        remote.hub.publish(event, value);
     }
 }
 
-/// `$znoti.createNotification` hook: joined apps show the notification too.
+/// `$znoti.createNotification` hook: joined users who may see the conversation get it too.
 pub fn forward_notification(app: &AppHandle, title: &str, body: &str, tag: &str, silent: bool, image: Option<&[u8]>) {
     let Some(remote) = app.try_state::<Arc<Remote>>() else { return };
     if !remote.hub.has_clients() {
@@ -345,14 +505,10 @@ pub fn forward_notification(app: &AppHandle, title: &str, body: &str, tag: &str,
     }
     use base64::Engine as _;
     let image = image.filter(|d| d.len() <= MAX_NOTIFICATION_IMAGE).map(|d| base64::engine::general_purpose::STANDARD.encode(d));
-    remote.hub.publish(&json!({
-        "t": "event",
-        "event": NOTIFICATION_EVENT,
-        "payload": { "title": title, "body": body, "tag": tag, "silent": silent, "image": image },
-    }));
+    remote.hub.publish(NOTIFICATION_EVENT, json!({ "title": title, "body": body, "tag": tag, "silent": silent, "image": image }));
 }
 
-// ---- commands ----
+// ---- commands: host ----
 
 type RemoteState<'a> = State<'a, Arc<Remote>>;
 
@@ -380,65 +536,159 @@ pub async fn remote_set_server(remote: RemoteState<'_>, config: ServerConfig) ->
         return Err("Cổng phải từ 1024 đến 65535".into());
     }
     let previous = remote.server_config();
-    let name = config.name.trim().chars().take(60).collect::<String>();
     remote.update_config(|c| {
-        c.server = ServerConfig { code: previous.code.clone(), name: if name.is_empty() { computer_name() } else { name }, ..config };
+        c.server.enabled = config.enabled;
+        c.server.port = config.port;
+        c.server.allow_network = config.allow_network;
     })?;
+    remote.update_server_identity(Some(config.name), Some(config.public_url))?;
     let next = remote.server_config();
     let listener_changed = next.enabled != previous.enabled || next.port != previous.port || next.allow_network != previous.allow_network;
-    if listener_changed || remote.server.lock().await.is_none() && next.enabled {
+    if listener_changed || (next.enabled && remote.server.lock().await.is_none()) {
         remote.inner().apply_server().await;
-    } else {
-        remote.changed();
     }
     Ok(())
 }
 
-/// New access code: every joined app is disconnected and needs the new code.
+/// The first admin account (only while there is none).
 #[tauri::command]
-pub fn remote_regenerate_code(remote: RemoteState<'_>) -> Result<String, String> {
-    let code = new_code();
-    remote.update_config(|c| c.server.code = code.clone())?;
-    remote.hub.kick_all("codeChanged");
+pub fn remote_admin_setup(remote: RemoteState<'_>, username: String, password: String, display_name: Option<String>) -> Result<Value, String> {
+    let auth = remote.auth().ok_or("Không mở được cơ sở dữ liệu tài khoản.")?;
+    if auth.store.count_admins().map_err(|e| e.message)? > 0 {
+        return Err("Đã có quản trị viên. Quản lý tài khoản trong trang quản trị.".into());
+    }
+    let hash = auth::hash_password(&password).map_err(|e| e.message)?;
+    let user = auth.store.create_user(&username, display_name.as_deref().unwrap_or_default(), "", "local", Some(&hash), true).map_err(|e| e.message)?;
+    auth.store.audit(Some(&user), "user.create", &user.username, json!({ "isAdmin": true, "via": "host app" }), "127.0.0.1");
+    remote.update_config(|c| c.owner_user_id = user.id.clone())?;
     remote.changed();
-    Ok(code)
+    Ok(json!(user))
 }
 
+/// Opens the admin console in the browser, signed in as the owner (a one-time link).
 #[tauri::command]
-pub fn remote_kick(remote: RemoteState<'_>, id: String) -> bool {
-    let kicked = remote.hub.kick(&id, "kicked");
-    remote.changed();
-    kicked
+pub async fn remote_admin_open(remote: RemoteState<'_>) -> Result<String, String> {
+    let auth = remote.auth().ok_or("Không mở được cơ sở dữ liệu tài khoản.")?;
+    let Some(port) = remote.server.lock().await.as_ref().map(|h| h.port) else {
+        return Err("Bật Compola Server trước.".into());
+    };
+    let owner = remote.config.lock().owner_user_id.clone();
+    let user = auth
+        .store
+        .user(&owner)
+        .ok()
+        .filter(|u| u.is_admin && !u.disabled)
+        .or_else(|| auth.store.first_admin().ok().flatten())
+        .ok_or("Tạo tài khoản quản trị trước.")?;
+    let url = format!("http://127.0.0.1:{port}/api/auth/otp?t={}", auth.otp_create(&user.id));
+    tauri_plugin_opener::open_url(&url, None::<&str>).map_err(|e| e.to_string())?;
+    Ok(url)
 }
 
-/// Checks the server and the code, saves the join and restarts the app joined.
+/// Revokes a joined session (the person signs in again to come back).
 #[tauri::command]
-pub async fn remote_join(app: AppHandle, remote: RemoteState<'_>, url: String, code: String, device_name: String) -> Result<(), String> {
+pub fn remote_kick(remote: RemoteState<'_>, id: String) -> Result<bool, String> {
+    let auth = remote.auth().ok_or("Không mở được cơ sở dữ liệu tài khoản.")?;
+    let session = auth.store.delete_session(&id).map_err(|e| e.message)?;
+    if let Some(s) = &session {
+        auth.store.audit(None, "session.revoke", &s.device_name, json!({ "userId": s.user_id, "deviceId": s.device_id, "via": "host app" }), "127.0.0.1");
+    }
+    remote.session_revoked(&id);
+    Ok(session.is_some())
+}
+
+// ---- commands: joining ----
+
+/// Checks the address and lists how to sign in: `{url, serverName, local, ldap, oidc}`.
+#[tauri::command]
+pub async fn remote_providers(url: String) -> Result<Value, String> {
+    let base = client::normalize_url(&url)?;
+    let mut providers = client::providers(&base).await?;
+    providers["url"] = json!(base.to_string());
+    Ok(providers)
+}
+
+fn device_name_or_default(name: &str) -> String {
+    let n: String = name.trim().chars().filter(|c| !c.is_control()).take(60).collect();
+    if n.is_empty() { computer_name() } else { n }
+}
+
+/// Username + password (local or LDAP): saves the device sign-in and restarts joined.
+#[tauri::command]
+pub async fn remote_join_password(
+    app: AppHandle,
+    remote: RemoteState<'_>,
+    url: String,
+    username: String,
+    password: String,
+    provider: Option<String>,
+    device_name: String,
+) -> Result<(), String> {
     if remote.is_joined() {
         return Err("Máy này đang tham gia một Compola Server khác.".into());
     }
     let base = client::normalize_url(&url)?;
-    let code = normalize_code(&code);
-    if code.len() < 20 {
-        return Err("Mã truy cập gồm 25 ký tự, dạng XXXXX-XXXXX-XXXXX-XXXXX-XXXXX.".into());
-    }
-    let info = client::probe(&base, &code).await?;
-    if info.instance == remote.config.lock().instance {
-        return Err("Đây là Compola Server của chính máy này.".into());
-    }
-    let device_name = device_name.trim().chars().take(60).collect::<String>();
-    let device_name = if device_name.is_empty() { computer_name() } else { device_name };
-    remote.update_config(|c| {
-        c.join = Some(JoinConfig { url: base.to_string(), code, device_name: device_name.clone(), server_name: info.name.clone() });
-        c.last_join = Some(LastJoin { url: base.to_string(), device_name: device_name.clone() });
+    let device_name = device_name_or_default(&device_name);
+    let instance = remote.config.lock().instance.clone();
+    let signed_in = client::login_password(&base, &username, &password, provider.as_deref().unwrap_or("local"), &device_name, &instance).await?;
+    let server_name = client::providers(&base).await.ok().and_then(|p| p.get("serverName").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+    remote.save_join(JoinConfig {
+        url: base.to_string(),
+        token: signed_in.token,
+        device_name,
+        server_name,
+        username: signed_in.username,
+        display_name: signed_in.display_name,
     })?;
-    log::info!("compola server: joining {}", base.host_str().unwrap_or_default());
+    log::info!("compola server: joined {}", base.host_str().unwrap_or_default());
     app.restart();
 }
 
-/// Leaves the server and restarts the app with its own engine (the host's account stays signed in).
+/// Sign-in through the browser (any provider, SSO included): device flow, then saves and restarts joined.
 #[tauri::command]
-pub fn remote_leave(app: AppHandle, remote: RemoteState<'_>) -> Result<(), String> {
+pub async fn remote_join_browser(app: AppHandle, remote: RemoteState<'_>, url: String, device_name: String) -> Result<(), String> {
+    if remote.is_joined() {
+        return Err("Máy này đang tham gia một Compola Server khác.".into());
+    }
+    let base = client::normalize_url(&url)?;
+    let device_name = device_name_or_default(&device_name);
+    let instance = remote.config.lock().instance.clone();
+    let start = client::device_start(&base, &device_name, &instance).await?;
+    let _ = app.emit_to("main", EVENT, json!({ "kind": "joinProgress", "userCode": start.user_code, "verifyUrl": start.verify_url }));
+    tauri_plugin_opener::open_url(&start.verify_url, None::<&str>).map_err(|e| e.to_string())?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *remote.join_cancel.lock() = Some(tx);
+    let outcome = tokio::select! {
+        r = client::device_wait(&base, &start) => r,
+        _ = rx => Err("Đã huỷ.".into()),
+    };
+    remote.join_cancel.lock().take();
+    let signed_in = outcome?;
+    let server_name = client::providers(&base).await.ok().and_then(|p| p.get("serverName").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+    remote.save_join(JoinConfig {
+        url: base.to_string(),
+        token: signed_in.token,
+        device_name,
+        server_name,
+        username: signed_in.username,
+        display_name: signed_in.display_name,
+    })?;
+    app.restart();
+}
+
+#[tauri::command]
+pub fn remote_join_cancel(remote: RemoteState<'_>) {
+    if let Some(tx) = remote.join_cancel.lock().take() {
+        let _ = tx.send(());
+    }
+}
+
+/// Leaves the server (signs this device out there when reachable) and restarts with the app's own engine.
+#[tauri::command]
+pub async fn remote_leave(app: AppHandle, remote: RemoteState<'_>) -> Result<(), String> {
+    if let Some(c) = &remote.client {
+        c.sign_out().await;
+    }
     remote.update_config(|c| c.join = None)?;
     app.restart();
 }
@@ -491,21 +741,4 @@ pub async fn remote_media_save(remote: RemoteState<'_>, url: String, dest_path: 
 pub async fn remote_media_open_file(remote: RemoteState<'_>, url: String, name: Option<String>) -> Result<Value, String> {
     let client = remote.client.clone().ok_or("not joined")?;
     client.media_open_file(&url, name.as_deref().unwrap_or_default()).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn codes_are_long_unambiguous_and_compared_loosely() {
-        let code = new_code();
-        assert_eq!(code.len(), 29);
-        assert_eq!(normalize_code(&code).len(), 25);
-        assert!(!code.contains(['0', 'O', '1', 'I', 'L']));
-        assert!(codes_match(&code, &code.to_lowercase().replace('-', " ")));
-        assert!(!codes_match(&code, &new_code()));
-        assert!(!codes_match("", ""));
-        assert!(!codes_match(&code, &code[..20]));
-    }
 }

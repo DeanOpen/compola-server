@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 
+use super::policy::Access;
 use super::{DEFAULT_PORT, EVENT, JoinConfig, NOTIFICATION_EVENT};
 
 const NOT_CONNECTED: &str = "Chưa kết nối được tới Compola Server.";
@@ -64,12 +65,6 @@ fn http_client() -> reqwest::Client {
     reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().unwrap_or_default()
 }
 
-/// What `GET /auth` answered.
-pub struct ServerInfo {
-    pub name: String,
-    pub instance: String,
-}
-
 fn describe(e: &reqwest::Error, base: &url::Url) -> String {
     let host = base.host_str().unwrap_or_default();
     if e.is_timeout() {
@@ -81,25 +76,117 @@ fn describe(e: &reqwest::Error, base: &url::Url) -> String {
     }
 }
 
-/// Checks that `base` is a Compola Server and `code` opens it.
-pub async fn probe(base: &url::Url, code: &str) -> Result<ServerInfo, String> {
-    let response = http_client()
-        .get(endpoint(base, "auth"))
-        .bearer_auth(code)
-        .timeout(Duration::from_secs(15))
+/// `GET /api/auth/providers`, after checking the address is a Compola Server.
+pub async fn providers(base: &url::Url) -> Result<Value, String> {
+    let http = http_client();
+    let info = http.get(endpoint(base, "info")).timeout(Duration::from_secs(15)).send().await.map_err(|e| describe(&e, base))?;
+    let info: Value = info.bytes().await.ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null);
+    if info.get("app").and_then(Value::as_str) != Some("compola-server") {
+        return Err("Địa chỉ này không phải Compola Server.".into());
+    }
+    let r = http.get(endpoint(base, "api/auth/providers")).timeout(Duration::from_secs(15)).send().await.map_err(|e| describe(&e, base))?;
+    let status = r.status().as_u16();
+    let body: Value = r.bytes().await.ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null);
+    if status != 200 {
+        return Err(api_error(&body, status));
+    }
+    Ok(body)
+}
+
+fn api_error(body: &Value, status: u16) -> String {
+    body.get("error").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("Máy chủ trả lời HTTP {status}."))
+}
+
+/// A device sign-in: the token plus who it belongs to.
+pub struct SignedIn {
+    pub token: String,
+    pub username: String,
+    pub display_name: String,
+}
+
+fn signed_in(body: &Value) -> Result<SignedIn, String> {
+    let token = body.get("token").and_then(Value::as_str).unwrap_or_default().to_owned();
+    if token.is_empty() {
+        return Err("Máy chủ không trả về phiên đăng nhập.".into());
+    }
+    let text = |k: &str| body.pointer(&format!("/user/{k}")).and_then(Value::as_str).unwrap_or_default().to_owned();
+    Ok(SignedIn { token, username: text("username"), display_name: text("displayName") })
+}
+
+async fn post_api(base: &url::Url, path: &str, body: Value) -> Result<(u16, Value), String> {
+    let r = http_client()
+        .post(endpoint(base, path))
+        .header("X-Compola", "1")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .timeout(Duration::from_secs(30))
         .send()
         .await
         .map_err(|e| describe(&e, base))?;
-    let status = response.status().as_u16();
-    let body: Value = response.bytes().await.ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-    if status == 401 {
-        return Err("Mã truy cập không đúng.".into());
+    let status = r.status().as_u16();
+    Ok((status, r.bytes().await.ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null)))
+}
+
+/// Username + password (local or LDAP) for this device.
+pub async fn login_password(base: &url::Url, username: &str, password: &str, provider: &str, device_name: &str, device_id: &str) -> Result<SignedIn, String> {
+    let (status, body) = post_api(
+        base,
+        "api/auth/login",
+        json!({ "username": username, "password": password, "provider": provider, "device": { "name": device_name, "id": device_id } }),
+    )
+    .await?;
+    if status != 200 {
+        return Err(api_error(&body, status));
     }
-    if status != 200 || body.get("app").and_then(Value::as_str) != Some("compola-server") {
-        return Err("Địa chỉ này không phải Compola Server.".into());
+    signed_in(&body)
+}
+
+pub struct DeviceStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub verify_url: String,
+    interval: u64,
+    expires_in: u64,
+}
+
+pub async fn device_start(base: &url::Url, device_name: &str, device_id: &str) -> Result<DeviceStart, String> {
+    let (status, body) = post_api(base, "api/device/start", json!({ "deviceName": device_name, "deviceId": device_id })).await?;
+    if status != 200 {
+        return Err(api_error(&body, status));
     }
     let text = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
-    Ok(ServerInfo { name: text("name"), instance: text("instance") })
+    // The browser goes to the address this app used (the server's public URL may be another name for it).
+    let code = text("userCode");
+    let verify_url = endpoint(base, &format!("admin/#/device?code={code}"));
+    Ok(DeviceStart {
+        device_code: text("deviceCode"),
+        user_code: code,
+        verify_url,
+        interval: body.get("interval").and_then(Value::as_u64).unwrap_or(2).clamp(1, 10),
+        expires_in: body.get("expiresIn").and_then(Value::as_u64).unwrap_or(600),
+    })
+}
+
+/// Polls until the person approved (or denied) this device in the browser.
+pub async fn device_wait(base: &url::Url, start: &DeviceStart) -> Result<SignedIn, String> {
+    let deadline = Instant::now() + Duration::from_secs(start.expires_in);
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(start.interval)).await;
+        let (status, body) = match post_api(base, "api/device/poll", json!({ "deviceCode": start.device_code })).await {
+            Ok(r) => r,
+            Err(_) => continue, // a network blip: keep waiting
+        };
+        if status != 200 {
+            return Err(api_error(&body, status));
+        }
+        match body.get("status").and_then(Value::as_str) {
+            Some("approved") => return signed_in(&body),
+            Some("denied") => return Err("Yêu cầu đăng nhập đã bị từ chối trên trình duyệt.".into()),
+            Some("expired") => return Err("Mã đã hết hạn. Thử lại.".into()),
+            _ => {}
+        }
+    }
+    Err("Mã đã hết hạn. Thử lại.".into())
 }
 
 // ---- client ----
@@ -117,6 +204,11 @@ pub struct Status {
     pub ever_connected: bool,
     /// Next automatic attempt, epoch ms.
     pub retry_at: Option<i64>,
+    /// This install's id (a device, never an identity).
+    pub device_id: String,
+    /// The server user this app is signed in as.
+    pub user: Option<Value>,
+    pub access: Option<Access>,
 }
 
 pub struct Client {
@@ -138,7 +230,7 @@ enum Failure {
 }
 
 impl Client {
-    pub fn new(app: AppHandle, join: JoinConfig) -> Result<Arc<Self>, String> {
+    pub fn new(app: AppHandle, join: JoinConfig, device_id: String) -> Result<Arc<Self>, String> {
         let base = normalize_url(&join.url)?;
         let status = Status {
             state: "connecting",
@@ -148,6 +240,9 @@ impl Client {
             device_name: join.device_name.clone(),
             ever_connected: false,
             retry_at: None,
+            device_id,
+            user: Some(json!({ "username": join.username, "displayName": join.display_name })),
+            access: None,
         };
         Ok(Arc::new(Self {
             app,
@@ -170,6 +265,18 @@ impl Client {
 
     pub fn status_json(&self) -> Value {
         serde_json::to_value(self.status.lock().clone()).unwrap_or(Value::Null)
+    }
+
+    /// Signs this device out on the server (best effort; used when leaving).
+    pub async fn sign_out(&self) {
+        let _ = self
+            .http
+            .post(endpoint(&self.base, "api/auth/logout"))
+            .bearer_auth(&self.join.token)
+            .header("X-Compola", "1")
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await;
     }
 
     pub fn retry_now(&self) {
@@ -212,7 +319,7 @@ impl Client {
                 _ => Duration::from_secs((1u64 << attempt.min(5)).min(30)),
             };
             let error = match failure {
-                Some(Failure::Auth) => Some("Mã truy cập không còn đúng (máy chủ đã đổi mã). Rời máy chủ rồi tham gia lại với mã mới.".to_owned()),
+                Some(Failure::Auth) => Some("Phiên đăng nhập đã hết hạn, bị thu hồi, hoặc tài khoản không còn quyền. Rời máy chủ rồi đăng nhập lại.".to_owned()),
                 Some(Failure::Other(e)) => Some(e),
                 None => None,
             };
@@ -235,9 +342,8 @@ impl Client {
         let _ = ws_url.set_scheme(scheme);
         let mut request = ws_url.as_str().into_client_request().map_err(|e| Failure::Other(e.to_string()))?;
         let headers = request.headers_mut();
-        let auth = format!("Bearer {}", self.join.code);
-        let device: String = url::form_urlencoded::byte_serialize(self.join.device_name.as_bytes()).collect();
-        for (k, v) in [("authorization", auth), ("x-compola-device", device)] {
+        let auth = format!("Bearer {}", self.join.token);
+        for (k, v) in [("authorization", auth)] {
             if let Ok(v) = http::HeaderValue::from_str(&v) {
                 headers.insert(k, v);
             }
@@ -298,7 +404,11 @@ impl Client {
         match msg.get("t").and_then(Value::as_str) {
             Some("hello") => {
                 let name = msg.pointer("/server/name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let user = msg.get("user").cloned();
+                let access: Option<Access> = msg.get("access").and_then(|a| serde_json::from_value(a.clone()).ok());
                 self.update(|s| {
+                    s.user = user.or(s.user.take());
+                    s.access = access;
                     s.state = "connected";
                     s.error = None;
                     s.ever_connected = true;
@@ -329,10 +439,16 @@ impl Client {
                     let _ = self.app.emit_to("main", event, payload);
                 }
             }
+            Some("access") => {
+                let access: Option<Access> = msg.get("access").and_then(|a| serde_json::from_value(a.clone()).ok());
+                if let Some(access) = access {
+                    self.update(|s| s.access = Some(access.clone()));
+                    let _ = self.app.emit_to("main", EVENT, json!({ "kind": "access", "access": access }));
+                }
+            }
             Some("bye") => {
                 return Some(match msg.get("reason").and_then(Value::as_str) {
-                    Some("kicked") => "Máy chủ đã ngắt kết nối thiết bị này.".into(),
-                    Some("codeChanged") => "Máy chủ đã đổi mã truy cập.".into(),
+                    Some("kicked" | "revoked") => "Quản trị viên đã thu hồi phiên đăng nhập hoặc quyền của bạn.".into(),
                     Some("restarted") => "Compola Server vừa khởi động lại.".into(),
                     Some("lagged") => "Kết nối quá chậm, đang kết nối lại.".into(),
                     _ => CONNECTION_LOST.into(),
@@ -389,7 +505,7 @@ impl Client {
     pub async fn forward_media(&self, request: &http::Request<Vec<u8>>) -> http::Response<Vec<u8>> {
         let url = endpoint(&self.base, &format!("media/load?{}", request.uri().query().unwrap_or_default()));
         let method = if request.method() == http::Method::HEAD { reqwest::Method::HEAD } else { reqwest::Method::GET };
-        let mut req = self.http.request(method, url).bearer_auth(&self.join.code).timeout(Duration::from_secs(120));
+        let mut req = self.http.request(method, url).bearer_auth(&self.join.token).timeout(Duration::from_secs(120));
         if let Some(range) = request.headers().get(http::header::RANGE) {
             req = req.header(reqwest::header::RANGE, range.as_bytes());
         }
@@ -433,7 +549,7 @@ impl Client {
                 let response = self
                     .http
                     .get(&target)
-                    .bearer_auth(&self.join.code)
+                    .bearer_auth(&self.join.token)
                     .header(reqwest::header::RANGE, format!("bytes={offset}-"))
                     .timeout(Duration::from_secs(300))
                     .send()
@@ -537,14 +653,14 @@ impl Client {
             let response = self
                 .http
                 .post(endpoint(&self.base, &format!("upload?{query}")))
-                .bearer_auth(&self.join.code)
+                .bearer_auth(&self.join.token)
                 .body(chunk)
                 .timeout(Duration::from_secs(300))
                 .send()
                 .await
                 .map_err(|e| describe(&e, &self.base))?;
             let status = response.status().as_u16();
-            let body: Value = response.bytes().await.ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+            let body: Value = response.bytes().await.ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null);
             if status != 200 {
                 let reason = body.get("error").and_then(Value::as_str).unwrap_or_default();
                 return Err(format!("Không gửi được {name} lên máy chủ (HTTP {status}) {reason}").trim().to_owned());
